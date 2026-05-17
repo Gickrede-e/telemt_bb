@@ -205,6 +205,82 @@ impl TlsExtensionBuilder {
     }
 }
 
+// ============= Extension shuffle / cipher pool helpers =============
+// Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §2.2.
+
+/// FNV-1a 64-bit hash over an arbitrary byte slice. Cheap, deterministic,
+/// well-mixed enough for selecting a cipher suite / extension permutation
+/// from a small pool. Not cryptographic.
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Pick a 16-bit cipher suite from `pool` deterministically by hashing `seed`.
+/// Falls back to `[0x1301, 0x1302, 0x1303]` when the pool is empty.
+pub(crate) fn select_cipher_from_pool(pool: &[u16], seed: &[u8]) -> [u8; 2] {
+    let fallback: [u16; 3] = [0x1301, 0x1302, 0x1303];
+    let effective: &[u16] = if pool.is_empty() { &fallback } else { pool };
+    let idx = (fnv1a_64(seed) as usize) % effective.len();
+    effective[idx].to_be_bytes()
+}
+
+/// Parse a flat TLS extension blob into `(etype, payload)` blocks, permute the
+/// blocks deterministically using `seed`, and re-emit a flat blob. Used to
+/// defeat the static ServerHello extension-order fingerprint while keeping the
+/// same client always seeing the same ordering (handshake retransmit safe).
+///
+/// RFC 8446 §4.2 explicitly permits any ordering. The caller is responsible
+/// for NOT including `pre_shared_key` (0x0029) in `blob` — it must be the last
+/// extension and must be appended AFTER the shuffle (§4.2.11).
+pub(crate) fn shuffle_extension_blocks(blob: &[u8], seed: &[u8]) -> Vec<u8> {
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= blob.len() {
+        let elen = u16::from_be_bytes([blob[pos + 2], blob[pos + 3]]) as usize;
+        let block_end = pos + 4 + elen;
+        if block_end > blob.len() {
+            // Defensive: leftover bytes (should not happen with our builder).
+            // Append the malformed tail to the last block to preserve byte-identity.
+            if let Some(last) = blocks.last_mut() {
+                last.extend_from_slice(&blob[pos..]);
+            } else {
+                return blob.to_vec();
+            }
+            break;
+        }
+        blocks.push(blob[pos..block_end].to_vec());
+        pos = block_end;
+    }
+
+    if blocks.len() < 2 {
+        return blob.to_vec();
+    }
+
+    let mut state: u64 = 0;
+    for (i, b) in seed.iter().enumerate() {
+        state ^= u64::from(*b).rotate_left((i as u32 * 5) & 63);
+        state = state.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    for i in (1..blocks.len()).rev() {
+        state ^= state >> 13;
+        state = state.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let j = (state as usize) % (i + 1);
+        blocks.swap(i, j);
+    }
+
+    let total: usize = blocks.iter().map(|b| b.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for block in &blocks {
+        out.extend_from_slice(block);
+    }
+    out
+}
+
 // ============= ServerHello Builder =============
 
 /// Builder for TLS ServerHello with correct structure
@@ -219,6 +295,9 @@ struct ServerHelloBuilder {
     compression: u8,
     /// Extensions
     extensions: TlsExtensionBuilder,
+    /// Optional seed used to permute reorderable extensions deterministically
+    /// (RFC 8446 §4.2). When `None`, ordering is the legacy fixed sequence.
+    shuffle_seed: Option<Vec<u8>>,
 }
 
 impl ServerHelloBuilder {
@@ -229,6 +308,7 @@ impl ServerHelloBuilder {
             cipher_suite: cipher_suite::TLS_AES_128_GCM_SHA256,
             compression: 0x00,
             extensions: TlsExtensionBuilder::new(),
+            shuffle_seed: None,
         }
     }
 
@@ -243,12 +323,25 @@ impl ServerHelloBuilder {
         self
     }
 
+    fn with_cipher_suite(mut self, cipher: [u8; 2]) -> Self {
+        self.cipher_suite = cipher;
+        self
+    }
+
+    fn with_extension_shuffle_seed(mut self, seed: &[u8]) -> Self {
+        self.shuffle_seed = Some(seed.to_vec());
+        self
+    }
+
     /// Build ServerHello message (without record header)
     fn build_message(&self) -> Vec<u8> {
         let Ok(session_id_len) = u8::try_from(self.session_id.len()) else {
             return Vec::new();
         };
-        let extensions = self.extensions.extensions.clone();
+        let extensions = match &self.shuffle_seed {
+            Some(seed) => shuffle_extension_blocks(&self.extensions.extensions, seed),
+            None => self.extensions.extensions.clone(),
+        };
         let Ok(extensions_len) = u16::try_from(extensions.len()) else {
             return Vec::new();
         };
@@ -522,17 +615,27 @@ pub fn build_server_hello(
     rng: &SecureRandom,
     alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
+    cipher_suites_pool: &[u16],
+    extension_order_randomize: bool,
+    digest_seed: &[u8; TLS_DIGEST_LEN],
 ) -> Vec<u8> {
     const MIN_APP_DATA: usize = 64;
     const MAX_APP_DATA: usize = MAX_TLS_CIPHERTEXT_SIZE;
     let fake_cert_len = fake_cert_len.clamp(MIN_APP_DATA, MAX_APP_DATA);
     let x25519_key = gen_fake_x25519_key(rng);
 
-    // Build ServerHello
-    let server_hello = ServerHelloBuilder::new(session_id.to_vec())
+    // Build ServerHello. Cipher pool + extension shuffle defeat the static
+    // TLS 1.3 fingerprint at the no-cache fallback path.
+    // Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §2.2.
+    let cipher = select_cipher_from_pool(cipher_suites_pool, digest_seed);
+    let mut builder = ServerHelloBuilder::new(session_id.to_vec())
         .with_x25519_key(&x25519_key)
         .with_tls13_version()
-        .build_record();
+        .with_cipher_suite(cipher);
+    if extension_order_randomize {
+        builder = builder.with_extension_shuffle_seed(digest_seed);
+    }
+    let server_hello = builder.build_record();
 
     // Build Change Cipher Spec record
     let change_cipher_spec = [

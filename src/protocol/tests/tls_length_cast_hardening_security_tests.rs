@@ -21,6 +21,7 @@ fn server_hello_builder_fails_closed_on_session_id_len_overflow() {
         cipher_suite: cipher_suite::TLS_AES_128_GCM_SHA256,
         compression: 0,
         extensions: TlsExtensionBuilder::new(),
+        shuffle_seed: None,
     };
 
     let message = builder.build_message();

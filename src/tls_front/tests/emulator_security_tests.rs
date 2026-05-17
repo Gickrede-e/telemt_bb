@@ -61,6 +61,8 @@ fn emulated_server_hello_ignores_oversized_alpn_when_marker_would_not_fit() {
         &rng,
         Some(oversized_alpn),
         0,
+        &[],
+        false,
     );
 
     assert_eq!(response[0], TLS_RECORD_HANDSHAKE);
@@ -99,6 +101,8 @@ fn emulated_server_hello_embeds_full_alpn_marker_when_body_can_fit() {
         &rng,
         Some(b"h2".to_vec()),
         0,
+        &[],
+        false,
     );
 
     let payload = first_app_data_payload(&response);
@@ -129,6 +133,8 @@ fn emulated_server_hello_prefers_cert_payload_over_alpn_marker() {
         &rng,
         Some(b"h2".to_vec()),
         0,
+        &[],
+        false,
     );
 
     let payload = first_app_data_payload(&response);

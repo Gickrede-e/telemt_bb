@@ -1526,6 +1526,8 @@ where
             rng,
             selected_alpn.clone(),
             config.censorship.tls_new_session_tickets,
+            &config.censorship.cipher_suites_pool,
+            config.censorship.extension_order_randomize,
         )
     } else {
         tls::build_server_hello(
@@ -1536,6 +1538,9 @@ where
             rng,
             selected_alpn.clone(),
             config.censorship.tls_new_session_tickets,
+            &config.censorship.cipher_suites_pool,
+            config.censorship.extension_order_randomize,
+            &validation_digest,
         )
     };
 
