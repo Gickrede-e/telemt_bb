@@ -1113,6 +1113,17 @@ where
         .as_deref()
         .and_then(|sni| find_matching_tls_domain(config, sni));
 
+    if config.censorship.ech_log_observed
+        && let Some(obs) = tls::observe_ech_in_client_hello(handshake)
+    {
+        debug!(
+            peer = %peer,
+            sni = %client_sni.as_deref().unwrap_or(""),
+            ech = ?obs,
+            "ECH-bearing ClientHello observed"
+        );
+    }
+
     let alpn_list = if config.censorship.alpn_enforce {
         tls::extract_alpn_from_client_hello(handshake)
     } else {

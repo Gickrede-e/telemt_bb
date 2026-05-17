@@ -2429,6 +2429,133 @@ fn light_fuzz_tls_header_classifier_and_parser_policy_consistency() {
     }
 }
 
+// ============= ECH (Encrypted ClientHello, 0xfe0d) observation tests =============
+// Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §2.3.
+
+#[test]
+fn ech_observation_returns_none_when_extension_absent() {
+    let ch = build_client_hello_with_exts(vec![], "ech.test");
+    assert_eq!(observe_ech_in_client_hello(&ch), None);
+}
+
+#[test]
+fn ech_observation_classifies_inner_indicator() {
+    // Inner: exactly 1 byte = 0x01.
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x01])], "ech.test");
+    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+}
+
+#[test]
+fn ech_observation_classifies_outer_payload() {
+    // Outer: 0x00 + 4-byte cipher_suite + 1-byte config_id + 2-byte enc-len
+    // + enc bytes + 2-byte payload-len + payload bytes. Mimic a 200-byte
+    // HPKE payload — well above the 11-byte minimum.
+    let mut data = Vec::new();
+    data.push(0x00); // outer variant
+    data.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // kdf+aead
+    data.push(0x00); // config_id
+    data.extend_from_slice(&32u16.to_be_bytes()); // enc len
+    data.extend_from_slice(&[0xab; 32]); // enc bytes
+    data.extend_from_slice(&160u16.to_be_bytes()); // payload len
+    data.extend_from_slice(&[0xcd; 160]); // payload bytes
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, data)], "ech.outer.test");
+    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Outer));
+}
+
+#[test]
+fn ech_observation_reports_malformed_on_truncated_outer() {
+    // Outer indicator with elen < 11 -> Malformed (not panic).
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x00, 0xaa, 0xbb])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_reports_malformed_on_wrong_type_byte() {
+    // Type byte 0x02 (neither 0x00 outer nor 0x01 inner).
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x02])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_reports_malformed_on_zero_length_payload() {
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_reports_malformed_when_inner_len_not_one() {
+    // Inner must be exactly 1 byte 0x01.
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x01, 0xff])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_does_not_panic_on_oversized_length_field() {
+    // Craft a raw ext blob where the ECH extension claims elen > remaining bytes.
+    let mut ext_blob = Vec::new();
+    ext_blob.extend_from_slice(&0xfe0du16.to_be_bytes());
+    ext_blob.extend_from_slice(&0xffffu16.to_be_bytes()); // claimed elen
+    ext_blob.extend_from_slice(&[0x00, 0xaa, 0xbb]); // only 3 bytes actually present
+    let ch = build_client_hello_with_raw_extensions(&ext_blob);
+    // Must not panic; bounds check yields either Malformed or None.
+    let observed = observe_ech_in_client_hello(&ch);
+    assert!(matches!(
+        observed,
+        None | Some(EchObservation::Malformed)
+    ));
+}
+
+#[test]
+fn ech_observation_finds_extension_after_other_extensions() {
+    // Place a benign extension first, then ECH.
+    let ch = build_client_hello_with_exts(
+        vec![(0x0a0a, Vec::new()), (0xfe0d, vec![0x01])],
+        "ech.after.grease",
+    );
+    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+}
+
+#[test]
+fn ech_observation_returns_first_when_duplicated() {
+    // Strictly speaking duplicate 0xfe0d is illegal. Behavior: return the
+    // first parsed observation, no panic, no double counting.
+    let ch = build_client_hello_with_exts(
+        vec![(0xfe0d, vec![0x01]), (0xfe0d, vec![0x00])],
+        "ech.dup.test",
+    );
+    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+}
+
+#[test]
+fn ech_observation_coexists_with_sni_and_alpn_parsers() {
+    // Build a CH with ALPN + ECH + SNI, assert each parser independently works.
+    let mut alpn_data = Vec::new();
+    alpn_data.extend_from_slice(&3u16.to_be_bytes());
+    alpn_data.push(2);
+    alpn_data.extend_from_slice(b"h2");
+    let ch = build_client_hello_with_exts(
+        vec![(0x0010, alpn_data), (0xfe0d, vec![0x01])],
+        "ech.mixed.test",
+    );
+    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+    let sni = extract_sni_from_client_hello(&ch);
+    assert_eq!(sni.as_deref(), Some("ech.mixed.test"));
+    let alpn = extract_alpn_from_client_hello(&ch);
+    assert_eq!(alpn, vec![b"h2".to_vec()]);
+}
+
 #[test]
 fn stress_random_noise_handshakes_never_authenticate() {
     let secret = b"stress_noise_secret";

@@ -100,6 +100,8 @@ mod extension_type {
     pub const KEY_SHARE: u16 = 0x0033;
     pub const SUPPORTED_VERSIONS: u16 = 0x002b;
     pub const ALPN: u16 = 0x0010;
+    /// Encrypted ClientHello (ECH), draft-ietf-tls-esni-22 stable codepoint.
+    pub const ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
 }
 
 /// TLS Cipher Suites
@@ -809,6 +811,118 @@ pub fn extract_alpn_from_client_hello(handshake: &[u8]) -> Vec<Vec<u8>> {
         pos += elen;
     }
     out
+}
+
+/// Classification of an Encrypted ClientHello (ECH) extension observed on the
+/// wire (codepoint `0xfe0d`, draft-ietf-tls-esni-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchObservation {
+    /// Inner-CH indicator: a single byte `0x01`.
+    Inner,
+    /// Outer-CH variant: type byte `0x00` plus an HPKE-encrypted payload.
+    Outer,
+    /// Extension is present but the length/type fields are inconsistent.
+    /// Reported so callers can metricize but MUST be treated as non-fatal —
+    /// malformed ECH must never become a DoS surface.
+    Malformed,
+}
+
+/// Detect whether a ClientHello carries an `encrypted_client_hello` (ECH)
+/// extension and classify the variant.
+///
+/// Returns `None` when no ECH extension is present. Returns
+/// `Some(EchObservation::Malformed)` on length/type inconsistency rather than
+/// panicking — every bounds check uses `pos + N <= ext_end` strictly so a
+/// hostile length-field cannot drive an out-of-bounds read.
+///
+/// The parser never errors; pairing it with `extract_sni_from_client_hello`
+/// and `extract_alpn_from_client_hello` is safe and additive.
+pub fn observe_ech_in_client_hello(handshake: &[u8]) -> Option<EchObservation> {
+    if handshake.len() < 43 || handshake[0] != TLS_RECORD_HANDSHAKE {
+        return None;
+    }
+
+    let record_len = u16::from_be_bytes([handshake[3], handshake[4]]) as usize;
+    if handshake.len() < 5 + record_len {
+        return None;
+    }
+
+    let mut pos = 5; // after record header
+    if handshake.get(pos).copied()? != 0x01 {
+        return None; // not ClientHello
+    }
+
+    pos += 4; // message type + 3-byte handshake length
+    pos += 2 + 32; // legacy_version + random
+    if pos + 1 > handshake.len() {
+        return None;
+    }
+
+    let session_id_len = *handshake.get(pos)? as usize;
+    pos += 1 + session_id_len;
+    if pos + 2 > handshake.len() {
+        return None;
+    }
+
+    let cipher_suites_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
+    pos += 2 + cipher_suites_len;
+    if pos + 1 > handshake.len() {
+        return None;
+    }
+
+    let comp_len = *handshake.get(pos)? as usize;
+    pos += 1 + comp_len;
+    if pos + 2 > handshake.len() {
+        return None;
+    }
+
+    let ext_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = pos + ext_len;
+    if ext_end > handshake.len() {
+        return None;
+    }
+
+    while pos + 4 <= ext_end {
+        let etype = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]);
+        let elen = u16::from_be_bytes([handshake[pos + 2], handshake[pos + 3]]) as usize;
+        pos += 4;
+        if pos + elen > ext_end {
+            return Some(EchObservation::Malformed);
+        }
+
+        if etype == extension_type::ENCRYPTED_CLIENT_HELLO {
+            if elen == 0 {
+                return Some(EchObservation::Malformed);
+            }
+            // RFC draft-ietf-tls-esni-22 §5: first byte is ECHClientHelloType.
+            let type_byte = handshake[pos];
+            return Some(match type_byte {
+                // outer: type(1) + HpkeSymmetricCipherSuite(4) + config_id(1)
+                //        + enc<u16>(2+) + payload<u16>(2+1) = >= 11 bytes total
+                0x00 => {
+                    if elen < 11 {
+                        EchObservation::Malformed
+                    } else {
+                        EchObservation::Outer
+                    }
+                }
+                // inner: exactly 1 byte
+                0x01 => {
+                    if elen == 1 {
+                        EchObservation::Inner
+                    } else {
+                        EchObservation::Malformed
+                    }
+                }
+                _ => EchObservation::Malformed,
+            });
+        }
+
+        pos += elen;
+    }
+
+    None
 }
 
 /// ClientHello TLS generation inferred from handshake fields.
