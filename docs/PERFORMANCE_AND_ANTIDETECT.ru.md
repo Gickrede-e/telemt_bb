@@ -13,8 +13,8 @@
 
 | ID | Рекомендация | Статус | Где |
 |---|---|---|---|
-| A | Шардинг IpTracker | **Отложено** — большой рефакторинг (~1100 LOC, adversarial-тесты), выделено в отдельный TODO | `src/ip_tracker.rs` (`TODO(perf)`) |
-| B | Accept-loop шардинг | **Частично** — userspace-шардинг (N таск на listener) сделан, kernel-level SO_REUSEPORT с N сокетами оставлен как TODO | `src/maestro/listeners.rs::spawn_tcp_accept_loops` (env `TELEMT_ACCEPT_SHARDS`) |
+| A | Шардинг IpTracker | **Сделано** — `active`/`recent` шардированы на N `parking_lot::Mutex` слотов; политика `max_ips`/`default_max_ips`/`limit_mode`/`limit_window` через `ArcSwap`; env `TELEMT_IPTRACKER_SHARDS` | `src/ip_tracker.rs` |
+| B | Accept-loop шардинг | **Сделано** — userspace-шардинг (`TELEMT_ACCEPT_SHARDS`) дополнен kernel-level SO_REUSEPORT с N сокетами через `TELEMT_KERNEL_REUSEPORT_SHARDS` / `..._AUTO` (Linux/Android) | `src/maestro/listeners.rs::{accept_shards_kernel, bind_listeners}`, `src/transport/socket.rs::create_sharded_listeners` |
 | C | Шардинг `Semaphore` `max_connections` | **Сделано** — `split_max_connections()` делит лимит на N подсемафоров по числу accept-shard | `src/maestro/listeners.rs::split_max_connections` |
 | D | `DashMap::with_shard_amount(num_cpus*4)` | **Сделано** — `Stats::user_stats` и `traffic_limiter` шардированы по CPU | `src/stats/mod.rs`, `src/proxy/traffic_limiter.rs` |
 | E | Per-core buffer pool | **Сделано** — `BufferPool` стал façade'ом над N `BufferPoolShard`, thread-sticky выбор шарда | `src/stream/buffer_pool.rs` |
@@ -22,7 +22,7 @@
 | G | DNS-кэш в `tls_front/fetcher` | **Сделано** — short-TTL LRU перед `lookup_host` | `src/tls_front/fetcher.rs` |
 | H | Убрать `spawn_blocking` для unknown-DC лога | **Не требуется** — `should_log_unknown_dc` уже rate-limit'ит по distinct DC (max-set фильтр), spawn_blocking не вызывается часто | `src/proxy/direct_relay.rs:66–85, 482–494` |
 | I | Явный `tokio::runtime::Builder` | **Сделано** — `TELEMT_WORKER_THREADS`, `TELEMT_MAX_BLOCKING_THREADS`, повышены `event_interval`/`global_queue_interval` | `src/main.rs` |
-| J | 3 task → 2 в middle-relay | **Отложено** — большой рефакторинг hot-path средневой релейной машины, требует отдельной сессии и нагрузочных тестов | `src/proxy/middle_relay.rs:1260, 1307` |
+| J | 3 task → 2 в middle-relay | **Заготовка** — env-флаг `TELEMT_MIDDLE_RELAY_MERGED_TASKS` распознаётся и логируется на старте; сама перестройка hot-path `select!`-петли оставлена за отдельным релизом после нагрузочных тестов (§1bis.7) | `src/proxy/middle_relay.rs::{MIDDLE_RELAY_MERGED_TASKS, init_middle_relay_feature_flags}` |
 | K | `Arc<AcceptContext>` на accept fan-out | **Сделано** — TCP accept loop делает 1 `Arc::clone` вместо ~12 | `src/maestro/listeners.rs::AcceptContext` |
 
 **Анти-детект, статус:**
@@ -30,11 +30,13 @@
 | Пункт | Статус | Где |
 |---|---|---|
 | GREASE по умолчанию (2.1) | **Сделано** — `grease_enabled = true` | `src/config/types.rs::EmulationConfig` |
-| Ротация cipher suite в эмулируемом ServerHello (2.2) | **Частично** — при отсутствии upstream-профиля выбор по hash(ClientHello digest) | `src/tls_front/emulator.rs` |
-| ECH parsing (2.3) | **Не сделано** — оставлено как roadmap |  |
-| Timing jitter ServerHello (2.4), Decoy records (2.5), ALPN profiles (2.6), Bad CH → mask-host fallback (2.7), Multi-host masking (2.8) | **Не сделано** — рекомендации остаются в этом документе |  |
-
-Все нереализованные пункты сохранены ниже с file:line, оценкой эффекта и эскизом подхода — чтобы можно было поднять их в отдельной фокусной сессии.
+| Ротация cipher suite в эмулируемом ServerHello (2.2) | **Сделано** — пул `cipher_suites_pool` (по умолчанию `[0x1301, 0x1302, 0x1303]`) + детерминированный shuffle расширений по хэшу ClientHello digest | `src/tls_front/emulator.rs::{select_cipher_from_pool, permute_extensions_by_digest}`, `src/protocol/tls.rs::{select_cipher_from_pool, shuffle_extension_blocks}` |
+| ECH parsing (2.3) | **Сделано** — extension `0xfe0d` распознаётся и классифицируется (`EchObservation::{Inner,Outer,Malformed}`); опциональный debug-trace через `ech_log_observed` | `src/protocol/tls.rs::observe_ech_in_client_hello` |
+| Timing jitter ServerHello (2.4) | **Сделано** — log-normal jitter (`server_hello_delay_min_ms`/`max_ms` дефолты 8/24 мс) применяется на 18+ callsite'ах | `src/proxy/handshake.rs::maybe_apply_server_hello_delay` |
+| Decoy records (2.5) | **Сделано** — ±3% jitter размера ApplicationData; до 4 ticket records | `src/tls_front/emulator.rs:18–35` |
+| ALPN profiles (2.6) | **Сделано** — `alpn_profiles` пул выбирается по `hash(sni || time_bucket)`; пересечение с client ALPN по правилу RFC 7301 §3.2; легасный `h2 > http/1.1` остаётся fallback'ом | `src/proxy/handshake.rs::select_alpn_echo` |
+| Bad CH → mask-host fallback (2.7) | **Сделано** — `UnknownSniAction::Mask` → `HandshakeResult::BadClient` форвардит на masking host | `src/proxy/handshake.rs:1140–1217` |
+| Multi-host masking (2.8) | **Сделано** — `mask_hosts: Vec<String>` + `mask_host_by_sni: HashMap` (case-insensitive); SNI-карта переопределяет, иначе `hash(peer_ip) % len`; `mask_host` сохраняется как legacy-fallback | `src/proxy/masking.rs::mask_host_for_initial_data` |
 
 ---
 
