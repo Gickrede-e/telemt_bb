@@ -367,8 +367,11 @@ impl UserIpTracker {
         for shard in self.shards.iter() {
             let mut slot = shard.lock();
             for user_recent in slot.recent.values_mut() {
-                pruned_recent_entries = pruned_recent_entries
-                    .saturating_add(Self::prune_recent(user_recent, now, window));
+                pruned_recent_entries = pruned_recent_entries.saturating_add(Self::prune_recent(
+                    user_recent,
+                    now,
+                    window,
+                ));
             }
 
             let mut users_to_check =
@@ -574,8 +577,11 @@ impl UserIpTracker {
         let mut pruned_recent_total: usize = 0;
         for slot in shard_guards.iter_mut() {
             if let Some(user_recent) = slot.recent.get_mut(username) {
-                pruned_recent_total = pruned_recent_total
-                    .saturating_add(Self::prune_recent(user_recent, now, window));
+                pruned_recent_total = pruned_recent_total.saturating_add(Self::prune_recent(
+                    user_recent,
+                    now,
+                    window,
+                ));
             }
             if let Some(per_ip) = slot.recent.get(username) {
                 user_recent_total = user_recent_total.saturating_add(per_ip.len());
@@ -602,12 +608,7 @@ impl UserIpTracker {
             if deny {
                 return Err(format!(
                     "IP limit reached for user '{}': active={}/{} recent={}/{} mode={:?}",
-                    username,
-                    user_active_total,
-                    limit,
-                    user_recent_total,
-                    limit,
-                    mode
+                    username, user_active_total, limit, user_recent_total, limit, mode
                 ));
             }
         }

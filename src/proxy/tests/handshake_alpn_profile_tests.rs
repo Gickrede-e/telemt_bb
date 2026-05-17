@@ -61,8 +61,8 @@ fn distribution_across_many_snis_covers_all_profiles() {
     let mut h11 = 0u32;
     for i in 0u32..1000 {
         let sni = format!("host-{}.example", i);
-        let pick = select_alpn_echo(&alpn, Some(&sni), &profiles, 0)
-            .expect("intersection non-empty");
+        let pick =
+            select_alpn_echo(&alpn, Some(&sni), &profiles, 0).expect("intersection non-empty");
         if pick == b("h2") {
             h2 += 1;
         } else if pick == b("http/1.1") {

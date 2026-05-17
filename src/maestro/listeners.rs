@@ -544,173 +544,175 @@ pub(crate) fn spawn_tcp_accept_loops(
             tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
-                    Ok((stream, peer_addr)) => {
-                        let rst_mode = config_rx.borrow().general.rst_on_close;
-                        #[cfg(unix)]
-                        let raw_fd = {
-                            use std::os::unix::io::AsRawFd;
-                            stream.as_raw_fd()
-                        };
-                        if matches!(rst_mode, RstOnCloseMode::Errors | RstOnCloseMode::Always) {
-                            let _ = set_linger_zero(&stream);
-                        }
-                        if !*admission_rx_tcp.borrow() {
-                            debug!(peer = %peer_addr, "Admission gate closed, dropping connection");
-                            drop(stream);
-                            continue;
-                        }
-                        let accept_permit_timeout_ms =
-                            config_rx.borrow().server.accept_permit_timeout_ms;
-                        let permit = if accept_permit_timeout_ms == 0 {
-                            match max_connections_tcp.clone().acquire_owned().await {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    error!("Connection limiter is closed");
-                                    break;
-                                }
+                        Ok((stream, peer_addr)) => {
+                            let rst_mode = config_rx.borrow().general.rst_on_close;
+                            #[cfg(unix)]
+                            let raw_fd = {
+                                use std::os::unix::io::AsRawFd;
+                                stream.as_raw_fd()
+                            };
+                            if matches!(rst_mode, RstOnCloseMode::Errors | RstOnCloseMode::Always) {
+                                let _ = set_linger_zero(&stream);
                             }
-                        } else {
-                            match tokio::time::timeout(
-                                Duration::from_millis(accept_permit_timeout_ms),
-                                max_connections_tcp.clone().acquire_owned(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(permit)) => permit,
-                                Ok(Err(_)) => {
-                                    error!("Connection limiter is closed");
-                                    break;
+                            if !*admission_rx_tcp.borrow() {
+                                debug!(peer = %peer_addr, "Admission gate closed, dropping connection");
+                                drop(stream);
+                                continue;
+                            }
+                            let accept_permit_timeout_ms =
+                                config_rx.borrow().server.accept_permit_timeout_ms;
+                            let permit = if accept_permit_timeout_ms == 0 {
+                                match max_connections_tcp.clone().acquire_owned().await {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        error!("Connection limiter is closed");
+                                        break;
+                                    }
                                 }
-                                Err(_) => {
-                                    accept_ctx.stats.increment_accept_permit_timeout_total();
-                                    debug!(
-                                        peer = %peer_addr,
-                                        timeout_ms = accept_permit_timeout_ms,
-                                        "Dropping accepted connection: permit wait timeout"
+                            } else {
+                                match tokio::time::timeout(
+                                    Duration::from_millis(accept_permit_timeout_ms),
+                                    max_connections_tcp.clone().acquire_owned(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(permit)) => permit,
+                                    Ok(Err(_)) => {
+                                        error!("Connection limiter is closed");
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        accept_ctx.stats.increment_accept_permit_timeout_total();
+                                        debug!(
+                                            peer = %peer_addr,
+                                            timeout_ms = accept_permit_timeout_ms,
+                                            "Dropping accepted connection: permit wait timeout"
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
+                                }
+                            };
+                            let config = config_rx.borrow_and_update().clone();
+                            // One refcount bump on the hot accept path; individual
+                            // Arc clones happen inside the spawned task below.
+                            let ctx = Arc::clone(&accept_ctx);
+                            let proxy_protocol_enabled = listener_proxy_protocol;
+                            let real_peer_report = Arc::new(std::sync::Mutex::new(None));
+                            let real_peer_report_for_handler = real_peer_report.clone();
+
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(e) = ClientHandler::new_with_shared(
+                                    stream,
+                                    peer_addr,
+                                    config,
+                                    ctx.stats.clone(),
+                                    ctx.upstream_manager.clone(),
+                                    ctx.replay_checker.clone(),
+                                    ctx.buffer_pool.clone(),
+                                    ctx.rng.clone(),
+                                    ctx.me_pool.clone(),
+                                    ctx.route_runtime.clone(),
+                                    ctx.tls_cache.clone(),
+                                    ctx.ip_tracker.clone(),
+                                    ctx.beobachten.clone(),
+                                    ctx.shared.clone(),
+                                    proxy_protocol_enabled,
+                                    real_peer_report_for_handler,
+                                    #[cfg(unix)]
+                                    raw_fd,
+                                    rst_mode,
+                                )
+                                .run()
+                                .await
+                                {
+                                    let real_peer = match real_peer_report.lock() {
+                                        Ok(guard) => *guard,
+                                        Err(_) => None,
+                                    };
+                                    let peer_close_reason = peer_close_description(&e);
+                                    let handshake_close_reason =
+                                        expected_handshake_close_description(&e);
+
+                                    let me_closed = matches!(
+                                        &e,
+                                        crate::error::ProxyError::MiddleConnectionLost
                                     );
-                                    drop(stream);
-                                    continue;
-                                }
-                            }
-                        };
-                        let config = config_rx.borrow_and_update().clone();
-                        // One refcount bump on the hot accept path; individual
-                        // Arc clones happen inside the spawned task below.
-                        let ctx = Arc::clone(&accept_ctx);
-                        let proxy_protocol_enabled = listener_proxy_protocol;
-                        let real_peer_report = Arc::new(std::sync::Mutex::new(None));
-                        let real_peer_report_for_handler = real_peer_report.clone();
+                                    let route_switched =
+                                        matches!(&e, crate::error::ProxyError::RouteSwitched);
 
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            if let Err(e) = ClientHandler::new_with_shared(
-                                stream,
-                                peer_addr,
-                                config,
-                                ctx.stats.clone(),
-                                ctx.upstream_manager.clone(),
-                                ctx.replay_checker.clone(),
-                                ctx.buffer_pool.clone(),
-                                ctx.rng.clone(),
-                                ctx.me_pool.clone(),
-                                ctx.route_runtime.clone(),
-                                ctx.tls_cache.clone(),
-                                ctx.ip_tracker.clone(),
-                                ctx.beobachten.clone(),
-                                ctx.shared.clone(),
-                                proxy_protocol_enabled,
-                                real_peer_report_for_handler,
-                                #[cfg(unix)]
-                                raw_fd,
-                                rst_mode,
-                            )
-                            .run()
-                            .await
-                            {
-                                let real_peer = match real_peer_report.lock() {
-                                    Ok(guard) => *guard,
-                                    Err(_) => None,
-                                };
-                                let peer_close_reason = peer_close_description(&e);
-                                let handshake_close_reason =
-                                    expected_handshake_close_description(&e);
-
-                                let me_closed =
-                                    matches!(&e, crate::error::ProxyError::MiddleConnectionLost);
-                                let route_switched =
-                                    matches!(&e, crate::error::ProxyError::RouteSwitched);
-
-                                match (peer_close_reason, me_closed) {
-                                    (Some(reason), _) => {
-                                        if let Some(real_peer) = real_peer {
-                                            debug!(
-                                                peer = %peer_addr,
-                                                real_peer = %real_peer,
-                                                error = %e,
-                                                close_reason = reason,
-                                                "Connection closed by peer"
-                                            );
-                                        } else {
-                                            debug!(
-                                                peer = %peer_addr,
-                                                error = %e,
-                                                close_reason = reason,
-                                                "Connection closed by peer"
-                                            );
+                                    match (peer_close_reason, me_closed) {
+                                        (Some(reason), _) => {
+                                            if let Some(real_peer) = real_peer {
+                                                debug!(
+                                                    peer = %peer_addr,
+                                                    real_peer = %real_peer,
+                                                    error = %e,
+                                                    close_reason = reason,
+                                                    "Connection closed by peer"
+                                                );
+                                            } else {
+                                                debug!(
+                                                    peer = %peer_addr,
+                                                    error = %e,
+                                                    close_reason = reason,
+                                                    "Connection closed by peer"
+                                                );
+                                            }
                                         }
-                                    }
-                                    (_, true) => {
-                                        if let Some(real_peer) = real_peer {
-                                            warn!(peer = %peer_addr, real_peer = %real_peer, error = %e, "Connection closed: Middle-End dropped session");
-                                        } else {
-                                            warn!(peer = %peer_addr, error = %e, "Connection closed: Middle-End dropped session");
+                                        (_, true) => {
+                                            if let Some(real_peer) = real_peer {
+                                                warn!(peer = %peer_addr, real_peer = %real_peer, error = %e, "Connection closed: Middle-End dropped session");
+                                            } else {
+                                                warn!(peer = %peer_addr, error = %e, "Connection closed: Middle-End dropped session");
+                                            }
                                         }
-                                    }
-                                    _ if route_switched => {
-                                        if let Some(real_peer) = real_peer {
-                                            info!(peer = %peer_addr, real_peer = %real_peer, error = %e, "Connection closed by controlled route cutover");
-                                        } else {
-                                            info!(peer = %peer_addr, error = %e, "Connection closed by controlled route cutover");
+                                        _ if route_switched => {
+                                            if let Some(real_peer) = real_peer {
+                                                info!(peer = %peer_addr, real_peer = %real_peer, error = %e, "Connection closed by controlled route cutover");
+                                            } else {
+                                                info!(peer = %peer_addr, error = %e, "Connection closed by controlled route cutover");
+                                            }
                                         }
-                                    }
-                                    _ if is_expected_handshake_eof(&e) => {
-                                        let reason = handshake_close_reason
-                                            .unwrap_or("Peer closed during initial handshake");
-                                        if let Some(real_peer) = real_peer {
-                                            info!(
-                                                peer = %peer_addr,
-                                                real_peer = %real_peer,
-                                                error = %e,
-                                                close_reason = reason,
-                                                "Connection closed during initial handshake"
-                                            );
-                                        } else {
-                                            info!(
-                                                peer = %peer_addr,
-                                                error = %e,
-                                                close_reason = reason,
-                                                "Connection closed during initial handshake"
-                                            );
+                                        _ if is_expected_handshake_eof(&e) => {
+                                            let reason = handshake_close_reason
+                                                .unwrap_or("Peer closed during initial handshake");
+                                            if let Some(real_peer) = real_peer {
+                                                info!(
+                                                    peer = %peer_addr,
+                                                    real_peer = %real_peer,
+                                                    error = %e,
+                                                    close_reason = reason,
+                                                    "Connection closed during initial handshake"
+                                                );
+                                            } else {
+                                                info!(
+                                                    peer = %peer_addr,
+                                                    error = %e,
+                                                    close_reason = reason,
+                                                    "Connection closed during initial handshake"
+                                                );
+                                            }
                                         }
-                                    }
-                                    _ => {
-                                        if let Some(real_peer) = real_peer {
-                                            warn!(peer = %peer_addr, real_peer = %real_peer, error = %e, "Connection closed with error");
-                                        } else {
-                                            warn!(peer = %peer_addr, error = %e, "Connection closed with error");
+                                        _ => {
+                                            if let Some(real_peer) = real_peer {
+                                                warn!(peer = %peer_addr, real_peer = %real_peer, error = %e, "Connection closed with error");
+                                            } else {
+                                                warn!(peer = %peer_addr, error = %e, "Connection closed with error");
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        error!("Accept error: {}", e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                            });
+                        }
+                        Err(e) => {
+                            error!("Accept error: {}", e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
-            }
-        });
+            });
         }
     }
 }
@@ -824,8 +826,9 @@ mod kernel_reuseport_tests {
         };
         assert_eq!(sockets.len(), 4);
 
-        let counters: Vec<Arc<AtomicUsize>> =
-            (0..sockets.len()).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let counters: Vec<Arc<AtomicUsize>> = (0..sockets.len())
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
 
         let mut handles = Vec::new();
         for (i, sock) in sockets.into_iter().enumerate() {
@@ -833,11 +836,7 @@ mod kernel_reuseport_tests {
             let counter = counters[i].clone();
             handles.push(tokio::spawn(async move {
                 for _ in 0..64 {
-                    let res = tokio::time::timeout(
-                        Duration::from_secs(3),
-                        listener.accept(),
-                    )
-                    .await;
+                    let res = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
                     match res {
                         Ok(Ok((_stream, _peer))) => {
                             counter.fetch_add(1, Ordering::Relaxed);

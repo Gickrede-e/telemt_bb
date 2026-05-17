@@ -460,10 +460,8 @@ mod tls_domain_mask_host_tests {
     #[test]
     fn mask_hosts_distribution_is_stable_per_client_ip() {
         let mut config = config_with_tls_domains();
-        config.censorship.mask_hosts = vec![
-            "alpha.example".to_string(),
-            "beta.example".to_string(),
-        ];
+        config.censorship.mask_hosts =
+            vec!["alpha.example".to_string(), "beta.example".to_string()];
         let initial_data = client_hello_with_sni("any.test");
 
         let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5));
@@ -477,7 +475,8 @@ mod tls_domain_mask_host_tests {
     #[test]
     fn mask_host_by_sni_map_overrides_hash_distribution() {
         let mut config = config_with_tls_domains();
-        config.censorship.mask_hosts = vec!["alpha.example".to_string(), "beta.example".to_string()];
+        config.censorship.mask_hosts =
+            vec!["alpha.example".to_string(), "beta.example".to_string()];
         config
             .censorship
             .mask_host_by_sni

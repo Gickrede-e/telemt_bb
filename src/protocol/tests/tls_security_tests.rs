@@ -1449,8 +1449,8 @@ fn test_build_server_hello_structure() {
         None,
         0,
         &[],
-            false,
-            &client_digest,
+        false,
+        &client_digest,
     );
 
     assert!(response.len() > 100);
@@ -1485,8 +1485,8 @@ fn test_build_server_hello_digest() {
         None,
         0,
         &[],
-            false,
-            &client_digest,
+        false,
+        &client_digest,
     );
     let response2 = build_server_hello(
         secret,
@@ -1497,8 +1497,8 @@ fn test_build_server_hello_digest() {
         None,
         0,
         &[],
-            false,
-            &client_digest,
+        false,
+        &client_digest,
     );
 
     let digest1 = &response1[TLS_DIGEST_POS..TLS_DIGEST_POS + TLS_DIGEST_LEN];
@@ -1830,7 +1830,18 @@ fn server_hello_digest_verifies_against_full_response() {
     let session_id = vec![0xAA; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let response = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 1, &[], false, &client_digest);
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1024,
+        &rng,
+        None,
+        1,
+        &[],
+        false,
+        &client_digest,
+    );
     let mut zeroed = response.clone();
     zeroed[TLS_DIGEST_POS..TLS_DIGEST_POS + TLS_DIGEST_LEN].fill(0);
 
@@ -1853,7 +1864,18 @@ fn server_hello_digest_fails_after_single_byte_tamper() {
     let session_id = vec![0xBB; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let mut response = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 0, &[], false, &client_digest);
+    let mut response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1024,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
     response[TLS_DIGEST_POS + TLS_DIGEST_LEN + 1] ^= 0x01;
 
     let mut zeroed = response.clone();
@@ -1882,7 +1904,18 @@ fn server_hello_application_data_payload_varies_across_runs() {
 
     let mut unique_payloads: HashSet<Vec<u8>> = HashSet::new();
     for _ in 0..16 {
-        let response = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 0, &[], false, &client_digest);
+        let response = build_server_hello(
+            secret,
+            &client_digest,
+            &session_id,
+            1024,
+            &rng,
+            None,
+            0,
+            &[],
+            false,
+            &client_digest,
+        );
 
         let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
         let ccs_pos = 5 + sh_len;
@@ -1959,7 +1992,18 @@ fn server_hello_clamps_fake_cert_len_lower_bound() {
     let session_id = vec![0x77; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let response = build_server_hello(secret, &client_digest, &session_id, 1, &rng, None, 0, &[], false, &client_digest);
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
     let ccs_pos = 5 + sh_len;
@@ -1981,7 +2025,18 @@ fn server_hello_clamps_fake_cert_len_upper_bound() {
     let session_id = vec![0x66; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let response = build_server_hello(secret, &client_digest, &session_id, 65_535, &rng, None, 0, &[], false, &client_digest);
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        65_535,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
     let ccs_pos = 5 + sh_len;
@@ -2655,7 +2710,10 @@ fn ech_observation_returns_none_when_extension_absent() {
 fn ech_observation_classifies_inner_indicator() {
     // Inner: exactly 1 byte = 0x01.
     let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x01])], "ech.test");
-    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
 }
 
 #[test]
@@ -2672,7 +2730,10 @@ fn ech_observation_classifies_outer_payload() {
     data.extend_from_slice(&160u16.to_be_bytes()); // payload len
     data.extend_from_slice(&[0xcd; 160]); // payload bytes
     let ch = build_client_hello_with_exts(vec![(0xfe0d, data)], "ech.outer.test");
-    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Outer));
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Outer)
+    );
 }
 
 #[test]
@@ -2724,10 +2785,7 @@ fn ech_observation_does_not_panic_on_oversized_length_field() {
     let ch = build_client_hello_with_raw_extensions(&ext_blob);
     // Must not panic; bounds check yields either Malformed or None.
     let observed = observe_ech_in_client_hello(&ch);
-    assert!(matches!(
-        observed,
-        None | Some(EchObservation::Malformed)
-    ));
+    assert!(matches!(observed, None | Some(EchObservation::Malformed)));
 }
 
 #[test]
@@ -2737,7 +2795,10 @@ fn ech_observation_finds_extension_after_other_extensions() {
         vec![(0x0a0a, Vec::new()), (0xfe0d, vec![0x01])],
         "ech.after.grease",
     );
-    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
 }
 
 #[test]
@@ -2748,7 +2809,10 @@ fn ech_observation_returns_first_when_duplicated() {
         vec![(0xfe0d, vec![0x01]), (0xfe0d, vec![0x00])],
         "ech.dup.test",
     );
-    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
 }
 
 #[test]
@@ -2762,7 +2826,10 @@ fn ech_observation_coexists_with_sni_and_alpn_parsers() {
         vec![(0x0010, alpn_data), (0xfe0d, vec![0x01])],
         "ech.mixed.test",
     );
-    assert_eq!(observe_ech_in_client_hello(&ch), Some(EchObservation::Inner));
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
     let sni = extract_sni_from_client_hello(&ch);
     assert_eq!(sni.as_deref(), Some("ech.mixed.test"));
     let alpn = extract_alpn_from_client_hello(&ch);

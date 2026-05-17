@@ -1874,6 +1874,7 @@ pub struct AntiCensorshipConfig {
     /// `mask_host` for selection. Selection rule:
     ///   1. If client SNI matches an entry in `mask_host_by_sni` map → use mapped host.
     ///   2. Else `hash(client_ip) % mask_hosts.len() → mask_hosts[i]`.
+    ///
     /// Legacy `mask_host` is still honored as final fallback.
     /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.8.
     #[serde(default)]
