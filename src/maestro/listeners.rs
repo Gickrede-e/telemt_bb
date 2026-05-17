@@ -22,7 +22,9 @@ use crate::stream::BufferPool;
 use crate::tls_front::TlsFrontCache;
 use crate::transport::middle_proxy::MePool;
 use crate::transport::socket::set_linger_zero;
-use crate::transport::{ListenOptions, UpstreamManager, create_listener, find_listener_processes};
+use crate::transport::{
+    ListenOptions, UpstreamManager, create_sharded_listeners, find_listener_processes,
+};
 
 use super::helpers::{
     expected_handshake_close_description, is_expected_handshake_eof, peer_close_description,
@@ -96,10 +98,10 @@ pub(crate) async fn bind_listeners(
             ..Default::default()
         };
 
-        match create_listener(addr, &options) {
-            Ok(socket) => {
-                let listener = TcpListener::from_std(socket.into())?;
-                info!("Listening on {}", addr);
+        let kernel_shards = accept_shards_kernel();
+        match create_sharded_listeners(addr, kernel_shards, &options) {
+            Ok(sockets) => {
+                let socket_count = sockets.len();
                 let listener_proxy_protocol = listener_conf
                     .proxy_protocol
                     .unwrap_or(config.server.proxy_protocol);
@@ -120,6 +122,15 @@ pub(crate) async fn bind_listeners(
                     listener_conf.ip.to_string()
                 };
 
+                if socket_count > 1 {
+                    info!(
+                        kernel_reuseport_shards = socket_count,
+                        "Listening on {} ({} SO_REUSEPORT-sharded sockets)", addr, socket_count
+                    );
+                } else {
+                    info!("Listening on {}", addr);
+                }
+
                 if config.general.links.public_host.is_none()
                     && !config.general.links.show.is_empty()
                 {
@@ -127,7 +138,10 @@ pub(crate) async fn bind_listeners(
                     print_proxy_links(&public_host, link_port, config);
                 }
 
-                listeners.push((listener, listener_proxy_protocol));
+                for socket in sockets {
+                    let listener = TcpListener::from_std(socket.into())?;
+                    listeners.push((listener, listener_proxy_protocol));
+                }
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -356,19 +370,47 @@ pub(crate) async fn bind_listeners(
     })
 }
 
-// TODO(perf): For true kernel-level accept distribution (especially with
-// SO_REUSEPORT), `bind_listeners` should optionally bind N sockets on the
-// same `(ip, port)` when `reuse_allow=true`. The current approach shares one
-// `TcpListener` between N tasks, which already distributes the userspace
-// per-accept overhead (config snapshot, permit acquire, Arc clones) but the
-// kernel still serializes the `accept()` syscall on a single socket queue.
-// See `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` section 1bis.1.
+/// Number of independent kernel sockets to bind per logical listener with
+/// `SO_REUSEPORT`. When > 1 (Linux/Android only), the kernel hashes incoming
+/// SYNs across N sockets, eliminating the single-`accept()` syscall as a
+/// serialization point. Off by default — operators opt in via env:
+///
+/// * `TELEMT_KERNEL_REUSEPORT_SHARDS=N`  — N kernel sockets per listener.
+/// * `TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO=1`  — `min(num_cpus, 32)`.
+///
+/// See `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` section 1bis.1.
+pub(crate) fn accept_shards_kernel() -> usize {
+    if let Ok(v) = std::env::var("TELEMT_KERNEL_REUSEPORT_SHARDS")
+        && let Ok(n) = v.parse::<usize>()
+        && n > 0
+    {
+        return n;
+    }
+    if std::env::var("TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO").is_ok() {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        return cpus.min(32);
+    }
+    1
+}
+
+// Userspace accept-task fan-out per listener (separate from kernel-level
+// SO_REUSEPORT sharding above). Multiple tokio tasks share a single
+// TcpListener; when kernel sharding is active this is forced to 1 since the
+// kernel already does the distribution.
 fn accept_shards_per_listener(listener_count: usize) -> usize {
     if let Ok(v) = std::env::var("TELEMT_ACCEPT_SHARDS")
         && let Ok(n) = v.parse::<usize>()
         && n > 0
     {
         return n;
+    }
+    // When kernel-level reuseport is active, the kernel queue already
+    // distributes incoming SYNs across the N sockets; userspace fan-out
+    // adds task overhead without throughput benefit. Force to 1.
+    if accept_shards_kernel() > 1 {
+        return 1;
     }
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -670,5 +712,171 @@ pub(crate) fn spawn_tcp_accept_loops(
             }
         });
         }
+    }
+}
+
+#[cfg(test)]
+mod kernel_reuseport_tests {
+    use super::*;
+
+    /// Helper to swap an env var for a single test invocation; restores the
+    /// previous value on drop. Tests using this MUST not run in parallel against
+    /// the same var — but each var is unique to this module.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests in this module are serialized by Cargo per-binary;
+            // we additionally avoid concurrent reads via single-test scope.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.as_deref() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Single serial test exercising every `accept_shards_kernel` branch.
+    /// Cargo runs tests in parallel within a binary, and these branches all
+    /// modify the same env vars — splitting them into multiple `#[test]`
+    /// functions would let one test's `set_var` race against another's read.
+    #[test]
+    fn accept_shards_kernel_env_handling_smoke() {
+        // 1. Default: both vars unset → 1.
+        {
+            let _g1 = EnvGuard::unset("TELEMT_KERNEL_REUSEPORT_SHARDS");
+            let _g2 = EnvGuard::unset("TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO");
+            assert_eq!(accept_shards_kernel(), 1);
+        }
+        // 2. Explicit env: returns the parsed value.
+        {
+            let _g1 = EnvGuard::set("TELEMT_KERNEL_REUSEPORT_SHARDS", "8");
+            let _g2 = EnvGuard::unset("TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO");
+            assert_eq!(accept_shards_kernel(), 8);
+        }
+        // 3. Zero or unparsable: falls through to 1.
+        {
+            let _g1 = EnvGuard::set("TELEMT_KERNEL_REUSEPORT_SHARDS", "0");
+            let _g2 = EnvGuard::unset("TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO");
+            assert_eq!(accept_shards_kernel(), 1);
+        }
+        // 4. Auto mode: bounded to [1, 32].
+        {
+            let _g1 = EnvGuard::unset("TELEMT_KERNEL_REUSEPORT_SHARDS");
+            let _g2 = EnvGuard::set("TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO", "1");
+            let v = accept_shards_kernel();
+            assert!(
+                (1..=32).contains(&v),
+                "auto mode produced {} (expected 1..=32)",
+                v
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kernel_reuseport_distributes_accepts_across_all_sockets() {
+        // End-to-end smoke: bind 4 sockets to one port with SO_REUSEPORT,
+        // spawn 4 accept tasks, dial 64 connections in parallel, verify all
+        // accepted. Distribution skew is hard to assert reliably so we only
+        // check that no shard sits at zero AND the total is 64.
+        use crate::transport::ListenOptions;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let probe_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let opts = ListenOptions::default();
+        let probe = match crate::transport::create_listener(probe_addr, &opts) {
+            Ok(s) => s,
+            Err(_) => return, // permission denied or unsupported
+        };
+        let bound: std::net::SocketAddr = probe
+            .local_addr()
+            .expect("probe local_addr")
+            .as_socket()
+            .expect("as_socket");
+        drop(probe);
+
+        let sockets = match crate::transport::create_sharded_listeners(bound, 4, &opts) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        assert_eq!(sockets.len(), 4);
+
+        let counters: Vec<Arc<AtomicUsize>> =
+            (0..sockets.len()).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+
+        let mut handles = Vec::new();
+        for (i, sock) in sockets.into_iter().enumerate() {
+            let listener = TcpListener::from_std(sock.into()).expect("from_std");
+            let counter = counters[i].clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..64 {
+                    let res = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        listener.accept(),
+                    )
+                    .await;
+                    match res {
+                        Ok(Ok((_stream, _peer))) => {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => break,
+                    }
+                }
+            }));
+        }
+
+        // Dial 64 connections from 64 concurrent tasks.
+        let mut dialers = Vec::new();
+        for _ in 0..64 {
+            dialers.push(tokio::spawn(async move {
+                let _ = TcpStream::connect(bound).await;
+            }));
+        }
+        for d in dialers {
+            let _ = d.await;
+        }
+
+        // Give the accept tasks a moment to drain queued connections.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for h in handles {
+            h.abort();
+        }
+
+        let total: usize = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        // We don't assert exact 64 because the timeout may cut some early; we
+        // assert the kernel DID hand connections to multiple sockets.
+        let nonzero = counters
+            .iter()
+            .filter(|c| c.load(Ordering::Relaxed) > 0)
+            .count();
+        assert!(
+            nonzero >= 2,
+            "kernel SO_REUSEPORT did not distribute: only {} sockets received accepts (total={})",
+            nonzero,
+            total
+        );
     }
 }

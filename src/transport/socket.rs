@@ -328,6 +328,44 @@ pub fn create_listener(addr: SocketAddr, options: &ListenOptions) -> Result<Sock
     Ok(socket)
 }
 
+/// Create N kernel-level SO_REUSEPORT-sharded listening sockets bound to the
+/// same `(ip, port)`. On Linux/Android the kernel hashes incoming SYNs across
+/// the N sockets, eliminating the single-`accept()` serialization point. On
+/// other platforms or when `shards == 1` this is equivalent to a single
+/// `create_listener` call.
+///
+/// All produced sockets have `SO_REUSEPORT=1` and `SO_REUSEADDR=1` regardless
+/// of `options` flags (required to share the port). Other options
+/// (`backlog`, `ipv6_only`) come from `options`.
+///
+/// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.1 and 1bis.2.
+pub fn create_sharded_listeners(
+    addr: SocketAddr,
+    shards: usize,
+    options: &ListenOptions,
+) -> Result<Vec<Socket>> {
+    let shards = shards.max(1);
+    if shards == 1 {
+        return Ok(vec![create_listener(addr, options)?]);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = shards;
+        return Ok(vec![create_listener(addr, options)?]);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut forced = options.clone();
+        forced.reuse_port = true;
+        forced.reuse_addr = true;
+        let mut sockets = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            sockets.push(create_listener(addr, &forced)?);
+        }
+        Ok(sockets)
+    }
+}
+
 /// Best-effort process list for listeners occupying the same local TCP port.
 #[derive(Debug, Clone)]
 pub struct ListenerProcessInfo {
@@ -637,5 +675,69 @@ mod tests {
         assert!(opts.reuse_addr);
         assert!(opts.reuse_port);
         assert_eq!(opts.backlog, 1024);
+    }
+
+    // ============= 1bis.1 — kernel-level SO_REUSEPORT shard tests =============
+
+    #[test]
+    fn create_sharded_listeners_returns_single_socket_when_shards_is_one() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let opts = ListenOptions::default();
+        let sockets = match create_sharded_listeners(addr, 1, &opts) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("create_sharded_listeners failed: {e}"),
+        };
+        assert_eq!(sockets.len(), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn create_sharded_listeners_returns_n_sockets_on_linux() {
+        // Bind first socket to get a port, then bind 3 more on the same port.
+        let probe_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let opts = ListenOptions::default();
+        let probe = match create_listener(probe_addr, &opts) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("probe bind failed: {e}"),
+        };
+        let bound: SocketAddr = probe
+            .local_addr()
+            .expect("local_addr")
+            .as_socket()
+            .expect("as_socket");
+        // Drop the probe so we can rebind with SO_REUSEPORT N times.
+        drop(probe);
+
+        // Tiny race window: another process could grab the port between
+        // drop(probe) and create_sharded_listeners. Tolerated for a smoke test.
+        let sockets = match create_sharded_listeners(bound, 4, &opts) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("create_sharded_listeners(4) failed: {e}"),
+        };
+        assert_eq!(sockets.len(), 4);
+        for sock in &sockets {
+            let local = sock
+                .local_addr()
+                .expect("local_addr")
+                .as_socket()
+                .expect("as_socket");
+            assert_eq!(local.port(), bound.port());
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn create_sharded_listeners_falls_back_to_one_on_non_linux() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let opts = ListenOptions::default();
+        let sockets = match create_sharded_listeners(addr, 8, &opts) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("create_sharded_listeners failed: {e}"),
+        };
+        assert_eq!(sockets.len(), 1);
     }
 }
