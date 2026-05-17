@@ -333,6 +333,9 @@ async fn wait_mask_outcome_budget(started: Instant, config: &ProxyConfig) {
 mod tls_domain_mask_host_tests {
     use super::{mask_host_for_initial_data, matching_tls_domain_for_sni};
     use crate::config::ProxyConfig;
+    use std::net::IpAddr;
+
+    const TEST_PEER_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
 
     fn client_hello_with_sni(sni_host: &str) -> Vec<u8> {
         let mut body = Vec::new();
@@ -398,7 +401,7 @@ mod tls_domain_mask_host_tests {
         let initial_data = client_hello_with_sni("b.com");
 
         assert_eq!(
-            mask_host_for_initial_data(&config, &initial_data),
+            mask_host_for_initial_data(&config, &initial_data, TEST_PEER_IP),
             "origin.example"
         );
     }
@@ -408,7 +411,119 @@ mod tls_domain_mask_host_tests {
         let config = config_with_tls_domains();
         let initial_data = client_hello_with_sni("b.com");
 
-        assert_eq!(mask_host_for_initial_data(&config, &initial_data), "b.com");
+        assert_eq!(
+            mask_host_for_initial_data(&config, &initial_data, TEST_PEER_IP),
+            "b.com"
+        );
+    }
+
+    // ============= 2.8 multi-host masking tests =============
+
+    #[test]
+    fn mask_hosts_list_uses_hash_distribution_when_no_sni_map_hit() {
+        let mut config = config_with_tls_domains();
+        config.censorship.mask_hosts = vec![
+            "alpha.example".to_string(),
+            "beta.example".to_string(),
+            "gamma.example".to_string(),
+        ];
+        let initial_data = client_hello_with_sni("unmapped.test");
+
+        // Distribute 1000 random IPs and assert no single host gets <20% or >50%.
+        let mut counts = [0u32; 3];
+        for octet in 0u32..1000 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                (octet >> 24) as u8,
+                (octet >> 16) as u8,
+                (octet >> 8) as u8,
+                octet as u8,
+            ));
+            let pick = mask_host_for_initial_data(&config, &initial_data, ip);
+            let idx = match pick {
+                "alpha.example" => 0,
+                "beta.example" => 1,
+                "gamma.example" => 2,
+                other => panic!("unexpected host {}", other),
+            };
+            counts[idx] += 1;
+        }
+        for (i, c) in counts.iter().enumerate() {
+            assert!(
+                *c >= 200 && *c <= 500,
+                "host {} got {} out of 1000 (expected 200..500)",
+                i,
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn mask_hosts_distribution_is_stable_per_client_ip() {
+        let mut config = config_with_tls_domains();
+        config.censorship.mask_hosts = vec![
+            "alpha.example".to_string(),
+            "beta.example".to_string(),
+        ];
+        let initial_data = client_hello_with_sni("any.test");
+
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5));
+        let first = mask_host_for_initial_data(&config, &initial_data, ip).to_string();
+        for _ in 0..100 {
+            let again = mask_host_for_initial_data(&config, &initial_data, ip);
+            assert_eq!(again, first.as_str());
+        }
+    }
+
+    #[test]
+    fn mask_host_by_sni_map_overrides_hash_distribution() {
+        let mut config = config_with_tls_domains();
+        config.censorship.mask_hosts = vec!["alpha.example".to_string(), "beta.example".to_string()];
+        config
+            .censorship
+            .mask_host_by_sni
+            .insert("special.test".to_string(), "exact.mask.target".to_string());
+        let initial_data = client_hello_with_sni("SPECIAL.TEST"); // case-insensitive
+
+        // Regardless of peer IP, SNI map hit must win.
+        for octet in 0u8..32 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, octet));
+            assert_eq!(
+                mask_host_for_initial_data(&config, &initial_data, ip),
+                "exact.mask.target"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_host_falls_back_to_legacy_when_sni_map_miss_and_no_pool() {
+        let config = config_with_tls_domains();
+        let initial_data = client_hello_with_sni("b.com"); // matches tls_domains
+
+        // No mask_hosts list, no mask_host_by_sni — fall through to legacy path.
+        assert_eq!(
+            mask_host_for_initial_data(&config, &initial_data, TEST_PEER_IP),
+            "b.com"
+        );
+    }
+
+    #[test]
+    fn mask_host_ipv6_client_distributes_deterministically() {
+        let mut config = config_with_tls_domains();
+        config.censorship.mask_hosts = vec![
+            "alpha.example".to_string(),
+            "beta.example".to_string(),
+            "gamma.example".to_string(),
+        ];
+        let initial_data = client_hello_with_sni("v6.test");
+
+        let ip = IpAddr::V6("2001:db8::1".parse().unwrap());
+        let a = mask_host_for_initial_data(&config, &initial_data, ip).to_string();
+        let b = mask_host_for_initial_data(&config, &initial_data, ip);
+        assert_eq!(a.as_str(), b);
+        // Distinct IPv6 hashes to a member of the pool (not a panic).
+        let ip2 = IpAddr::V6("2001:db8::2".parse().unwrap());
+        let pick2 = mask_host_for_initial_data(&config, &initial_data, ip2);
+        assert!(["alpha.example", "beta.example", "gamma.example"].contains(&pick2));
     }
 }
 
@@ -458,7 +573,54 @@ fn matching_tls_domain_for_sni<'a>(config: &'a ProxyConfig, sni: &str) -> Option
     None
 }
 
-fn mask_host_for_initial_data<'a>(config: &'a ProxyConfig, initial_data: &[u8]) -> &'a str {
+fn mask_host_for_initial_data<'a>(
+    config: &'a ProxyConfig,
+    initial_data: &[u8],
+    peer_ip: IpAddr,
+) -> &'a str {
+    let sni_opt = tls::extract_sni_from_client_hello(initial_data);
+
+    // 1) Explicit per-SNI map wins over everything else.
+    //
+    // Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §2.8.
+    if let Some(sni) = sni_opt.as_deref() {
+        for (k, v) in &config.censorship.mask_host_by_sni {
+            if k.eq_ignore_ascii_case(sni) {
+                return v.as_str();
+            }
+        }
+    }
+
+    // 2) Multi-host pool: hash(peer_ip) distributes clients across mask
+    //    hosts deterministically so the same client always lands on the
+    //    same backend within its session (handshake retransmit safe), but
+    //    different clients spread across the pool.
+    if !config.censorship.mask_hosts.is_empty() {
+        let hosts = &config.censorship.mask_hosts;
+        // FNV-1a over the IP's canonical byte form; covers both V4 and V6.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        match canonical_ip(peer_ip) {
+            IpAddr::V4(v4) => {
+                for b in v4.octets() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                h ^= 4;
+            }
+            IpAddr::V6(v6) => {
+                for b in v6.octets() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                h ^= 6;
+            }
+        }
+        let idx = (h as usize) % hosts.len();
+        return hosts[idx].as_str();
+    }
+
+    // 3) Legacy fallback: single mask_host, then SNI matching against
+    //    tls_domains, then tls_domain.
     let configured_mask_host = config
         .censorship
         .mask_host
@@ -469,7 +631,7 @@ fn mask_host_for_initial_data<'a>(config: &'a ProxyConfig, initial_data: &[u8]) 
         return configured_mask_host;
     }
 
-    tls::extract_sni_from_client_hello(initial_data)
+    sni_opt
         .as_deref()
         .and_then(|sni| matching_tls_domain_for_sni(config, sni))
         .unwrap_or(configured_mask_host)
@@ -849,7 +1011,7 @@ pub async fn handle_bad_client<R, W>(
         return;
     }
 
-    let mask_host = mask_host_for_initial_data(config, initial_data);
+    let mask_host = mask_host_for_initial_data(config, initial_data, peer.ip());
     let mask_port = config.censorship.mask_port;
 
     // Fail closed when fallback points at our own listener endpoint.
