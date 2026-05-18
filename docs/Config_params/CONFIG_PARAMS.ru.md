@@ -2401,17 +2401,24 @@
 | [`tls_fetch`](#tls_fetch) | `Table` | built-in defaults | `✘` |
 | [`mask`](#mask) | `bool` | `true` | `✘` |
 | [`mask_host`](#mask_host) | `String` | — | `✘` |
+| [`mask_hosts`](#mask_hosts) | `String[]` | `[]` | `✘` |
+| [`mask_host_by_sni`](#mask_host_by_sni) | `Table<String, String>` | `{}` | `✘` |
 | [`mask_port`](#mask_port) | `u16` | `443` | `✘` |
 | [`mask_unix_sock`](#mask_unix_sock) | `String` | — | `✘` |
 | [`fake_cert_len`](#fake_cert_len) | `usize` | `2048` | `✘` |
 | [`tls_emulation`](#tls_emulation) | `bool` | `true` | `✘` |
 | [`tls_front_dir`](#tls_front_dir) | `String` | `"tlsfront"` | `✘` |
-| [`server_hello_delay_min_ms`](#server_hello_delay_min_ms) | `u64` | `0` | `✘` |
-| [`server_hello_delay_max_ms`](#server_hello_delay_max_ms) | `u64` | `0` | `✘` |
+| [`server_hello_delay_min_ms`](#server_hello_delay_min_ms) | `u64` | `8` | `✘` |
+| [`server_hello_delay_max_ms`](#server_hello_delay_max_ms) | `u64` | `24` | `✘` |
 | [`tls_new_session_tickets`](#tls_new_session_tickets) | `u8` | `0` | `✘` |
 | [`tls_full_cert_ttl_secs`](#tls_full_cert_ttl_secs) | `u64` | `90` | `✘` |
 | [`serverhello_compact`](#serverhello_compact) | `bool` | `false` | `✘` |
+| [`cipher_suites_pool`](#cipher_suites_pool) | `u16[]` | `[0x1301, 0x1302, 0x1303]` | `✘` |
+| [`extension_order_randomize`](#extension_order_randomize) | `bool` | `true` | `✘` |
 | [`alpn_enforce`](#alpn_enforce) | `bool` | `true` | `✘` |
+| [`alpn_profiles`](#alpn_profiles) | `String[][]` | `[["h2","http/1.1"], ["http/1.1"]]` | `✘` |
+| [`alpn_profile_bucket_secs`](#alpn_profile_bucket_secs) | `u64` | `86400` | `✘` |
+| [`ech_log_observed`](#ech_log_observed) | `bool` | `false` | `✘` |
 | [`mask_proxy_protocol`](#mask_proxy_protocol) | `u8` | `0` | `✘` |
 | [`mask_shape_hardening`](#mask_shape_hardening) | `bool` | `true` | `✘` |
 | [`mask_shape_hardening_aggressive_mode`](#mask_shape_hardening_aggressive_mode) | `bool` | `false` | `✘` |
@@ -2492,12 +2499,41 @@
   - **Ограничения / валидация**: `String` (необязательный параметр).
     - Если задан параметр `mask_unix_sock`, `mask_host` не должен быть задан.
     - Если не задан параметр `mask_host` и `mask_unix_sock` не задан, Telemt по умолчанию устанавливает для `mask_host` значение `tls_domain`.
+    - Работает как *одиночный* маскирующий бэкенд (legacy-поведение). Когда `mask_hosts` или `mask_host_by_sni` непусты, они имеют приоритет — см. порядок выбора ниже.
   - **Описание**: Хост, используемый для маскировки при TLS-fronting.
   - **Пример**:
 
     ```toml
     [censorship]
     mask_host = "www.cloudflare.com"
+    ```
+## mask_hosts
+  - **Ограничения / валидация**: `String[]`. Каждый элемент — непустой хостнейм или IP. Если массив непуст, переопределяет одиночный `mask_host`.
+  - **Описание**: Пул кандидатов масочных хостов. Прокси детерминированно распределяет клиентов между ними по `hash(peer_ip) % len(mask_hosts)` — конкретный клиент в рамках одной сессии всегда попадает на один и тот же бэкенд (handshake retransmit-safe). Разные клиенты «размазываются» по пулу, и характерная для одного бэкенда концентрация исходящих потоков исчезает.
+
+    **Порядок выбора маскирующего хоста**:
+    1. Если SNI клиента (case-insensitive) совпадает с ключом в `mask_host_by_sni` — берётся значение из карты.
+    2. Иначе, если `mask_hosts` непуст — берётся `mask_hosts[hash(peer_ip) % len(mask_hosts)]`.
+    3. Иначе — legacy-fallback: явный `mask_host`, далее SNI-сравнение с `tls_domains`, далее сам `tls_domain` как окончательный fallback.
+
+    См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.8.
+  - **Пример**:
+
+    ```toml
+    [censorship]
+    mask_hosts = ["github.com", "cloudflare.com", "wikipedia.org"]
+    ```
+## mask_host_by_sni
+  - **Ограничения / валидация**: `Table<String, String>` — отображение `inbound SNI → mask host`. Ключи сравниваются без учёта регистра. Значения должны быть достижимы по `mask_port`.
+  - **Описание**: Опциональное явное переопределение масочного хоста по SNI. Совпадение здесь побеждает и hash-распределение `mask_hosts`, и legacy-fallback `mask_host`. Удобно, когда хочется, чтобы `cloudflare.com`-fronting реально терминировался на Cloudflare, `github.com`-fronting — на GitHub, и т. д., для максимальной аутентичности доменного фронтинга.
+
+    См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.8.
+  - **Пример**:
+
+    ```toml
+    [censorship.mask_host_by_sni]
+    "cloudflare.com" = "cloudflare.com"
+    "github.com"     = "github.com"
     ```
 ## mask_port
   - **Ограничения / валидация**: `u16`.
@@ -2549,17 +2585,17 @@
     tls_front_dir = "tlsfront"
     ```
 ## server_hello_delay_min_ms
-  - **Ограничения / валидация**: `u64` (миллисекунд).
-  - **Описание**: Минимальная задержка `server_hello` (в миллисекундах) для защиты от идентификации по fingerprint'у.
+  - **Ограничения / валидация**: `u64` (миллисекунд). По умолчанию `8`.
+  - **Описание**: Минимальная задержка `server_hello` (в миллисекундах) для защиты от fingerprint'а. Когда `server_hello_delay_max_ms > server_hello_delay_min_ms`, реальная задержка сэмплируется из **log-normal** распределения, ограниченного интервалом `[min, max]` — это точнее воспроизводит длинный хвост латентности реальных TLS-рукопожатий, чем равномерный jitter. См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.4.
   - **Пример**:
 
     ```toml
     [censorship]
-    server_hello_delay_min_ms = 0
+    server_hello_delay_min_ms = 8
     ```
 ## server_hello_delay_max_ms
-  - **Ограничения / валидация**: `u64` (миллисекунд). Должно быть \(<\) `timeouts.client_handshake * 1000`.
-  - **Описание**: Максимальная задержка `server_hello` (в миллисекундах) для защиты от идентификации по fingerprint'у.
+  - **Ограничения / валидация**: `u64` (миллисекунд). Должно быть \(<\) `timeouts.client_handshake * 1000`. По умолчанию `24`.
+  - **Описание**: Максимальная задержка `server_hello` (в миллисекундах) для защиты от fingerprint'а. Для полного отключения jitter'а выставьте обоим `min`/`max` значение `0`.
   - **Пример**:
 
     ```toml
@@ -2567,7 +2603,7 @@
     client_handshake = 30
 
     [censorship]
-    server_hello_delay_max_ms = 0
+    server_hello_delay_max_ms = 24
     ```
 ## tls_new_session_tickets
   - **Ограничения / валидация**: `u8`.
@@ -2590,11 +2626,31 @@
 ## serverhello_compact
   - **Ограничения / валидация**: `bool`.
   - **Описание**: Включает компактный профиль ServerHello/Fake-TLS для снижения сигнатуры размера ответа.
-  - **Example**:
+  - **Пример**:
 
     ```toml
     [censorship]
     serverhello_compact = false
+    ```
+## cipher_suites_pool
+  - **Ограничения / валидация**: `u16[]`. Каждое значение — идентификатор TLS 1.3 cipher suite (RFC 8446 §B.4). Пустой массив = встроенный дефолт `[0x1301, 0x1302, 0x1303]`. Значение `[0x1301, 0x1302]` воспроизводит pre-2.2 legacy-поведение.
+  - **Описание**: Пул cipher suite, из которого эмулируемый ServerHello выбирает значение, если upstream-профиль не захвачен. Выбор — FNV-1a-хэш от ClientHello digest, поэтому конкретный клиент всегда видит одну и ту же cipher suite (handshake-retransmit safe), но популяция охватывает весь пул. Это устраняет статический 2-вариантный JA3-S fingerprint, который выдавал прокси до 2.2.
+
+    Дефолты (по порядку): AES-128-GCM-SHA256 (`0x1301`), AES-256-GCM-SHA384 (`0x1302`), CHACHA20-POLY1305-SHA256 (`0x1303`) — все MTI согласно RFC 8446 §B.4. См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
+  - **Пример**:
+
+    ```toml
+    [censorship]
+    cipher_suites_pool = [0x1301, 0x1302, 0x1303]
+    ```
+## extension_order_randomize
+  - **Ограничения / валидация**: `bool`. По умолчанию `true`. Установка `false` восстанавливает pre-2.2 фиксированный порядок расширений (`key_share`, затем `supported_versions`).
+  - **Описание**: Когда `true`, порядок переставляемых расширений в эмулируемом ServerHello переставляется детерминированно от ClientHello digest через Fisher-Yates / xorshift mixer. RFC 8446 §4.2 явно разрешает любой порядок для расширений, которые сейчас отдаёт прокси (`key_share`, `supported_versions`). Шафл seed'ится digest'ом, поэтому ретрансмит того же ClientHello даст байт-в-байт идентичный ServerHello. См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
+  - **Пример**:
+
+    ```toml
+    [censorship]
+    extension_order_randomize = true
     ```
 ## alpn_enforce
   - **Ограничения / валидация**: `bool`.
@@ -2604,6 +2660,40 @@
     ```toml
     [censorship]
     alpn_enforce = true
+    ```
+## alpn_profiles
+  - **Ограничения / валидация**: `String[][]` — внешний массив — пул профилей, каждый профиль — список предпочтений в порядке убывания. Пустой внешний массив отключает profile-driven выбор и прокси сваливается на legacy-правило `h2 > http/1.1`. Значение `[["h2","http/1.1"]]` воспроизводит pre-2.6 legacy-поведение для клиентов `[h2, http/1.1]` ровно.
+  - **Описание**: Пул профилей echo'а ALPN. Для каждого рукопожатия прокси выбирает профиль по `hash(sni || time_bucket) % len(alpn_profiles)`, затем отправляет в echo **первый элемент профиля, который ТАКЖЕ присутствует в ALPN-списке клиента** (RFC 7301 §3.2 — пересечение). Если пересечение для выбранного профиля пусто, срабатывает legacy-fallback `h2 > http/1.1 > BadClient`.
+
+    Дефолт `[["h2","http/1.1"], ["http/1.1"]]` приводит к тому, что примерно у половины пар (SNI, день) echo будет только `http/1.1`, что ломает паттерн «один ALPN-fingerprint для всех». См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.6.
+  - **Пример**:
+
+    ```toml
+    [censorship]
+    alpn_profiles = [
+        ["h2", "http/1.1"],
+        ["http/1.1"],
+    ]
+    ```
+## alpn_profile_bucket_secs
+  - **Ограничения / валидация**: `u64` (секунды). `0` отключает time-компонент — конкретный SNI тогда залочен на один и тот же профиль навсегда. По умолчанию `86400` (одни сутки).
+  - **Описание**: Размер time-bucket'а для SNI-кейлированного выбора ALPN-профиля. Большие значения делают per-SNI ALPN-поведение стабильнее во времени (полезно для HTTP/2 connection-pooling на стороне наблюдателя), меньшие — ускоряют ротацию. См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.6.
+  - **Пример**:
+
+    ```toml
+    [censorship]
+    alpn_profile_bucket_secs = 86400
+    ```
+## ech_log_observed
+  - **Ограничения / валидация**: `bool`. По умолчанию `false`.
+  - **Описание**: Когда `true`, прокси пишет `tracing::debug`-строку при каждом ClientHello, несущем `encrypted_client_hello`-расширение (ECH, codepoint `0xfe0d`, draft-ietf-tls-esni-22). Полезно для измерения доли клиентов, фактически отправляющих ECH. Флаг не влияет на роутинг — ECH-несущие рукопожатия проходят через тот же `UnknownSniAction` (рекомендуется `mask`, чтобы они уходили на реально ECH-aware бэкенд). См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.3.
+
+    **Замечание по приватности**: при включении в trace-лог записывается IP клиента и outer SNI; пересмотрите политику хранения логов перед включением.
+  - **Пример**:
+
+    ```toml
+    [censorship]
+    ech_log_observed = false
     ```
 ## mask_proxy_protocol
   - **Ограничения / валидация**: `u8`. `0` = выключен, `1` = v1 (текстовый), `2` = v2 (бинарный).
@@ -3302,4 +3392,94 @@
     address = "127.0.0.1:9050"
     username = "alice"
     password = "secret"
+    ```
+
+
+# Переменные окружения (runtime-тюнинг)
+
+Несколько крутилок намеренно держатся вне TOML-схемы и читаются из окружения
+процесса — они управляют процесс-уровневой топологией рантайма, которая не
+меняется между соединениями, и имеют безопасные дефолты, совпадающие с
+историческим wire-поведением. Операторы пробрасывают их через `Environment=`
+в systemd-юните (бандлованный `install.sh` делает это автоматически, если
+переменная задана во время установки).
+
+| Переменная | По умолчанию | Эффект |
+| -------- | ------- | ------ |
+| [`TELEMT_WORKER_THREADS`](#telemt_worker_threads) | `num_cpus` | Число worker-тредов Tokio. |
+| [`TELEMT_MAX_BLOCKING_THREADS`](#telemt_max_blocking_threads) | `1024` | Размер blocking-пула Tokio. |
+| [`TELEMT_ACCEPT_SHARDS`](#telemt_accept_shards) | `num_cpus / listener_count` | Userspace accept-задач на listener. |
+| [`TELEMT_KERNEL_REUSEPORT_SHARDS`](#telemt_kernel_reuseport_shards) | unset (= 1, off) | N независимых сокетов `SO_REUSEPORT` на listener (Linux/Android). |
+| [`TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO`](#telemt_kernel_reuseport_shards_auto) | unset (= off) | Если задано, авто-выбор `min(num_cpus, 32)`. |
+| [`TELEMT_IPTRACKER_SHARDS`](#telemt_iptracker_shards) | `32` | Число шардов `UserIpTracker` (округляется до степени двойки, клампится в `[1, 1024]`). |
+| [`TELEMT_MIDDLE_RELAY_MERGED_TASKS`](#telemt_middle_relay_merged_tasks) | unset (= off) | Зарезервированный hook под будущую merged-tasks топологию middle-relay'я. |
+
+## TELEMT_WORKER_THREADS
+  - **Ограничения / валидация**: `usize`. `0` отвергается.
+  - **Описание**: Число worker-тредов Tokio. Большие значения повышают параллелизм на многоядерных хостах, но повышают и накладные расходы шедулера. По умолчанию `num_cpus`. См. `src/main.rs` (runtime builder).
+  - **Пример (systemd unit)**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_WORKER_THREADS=16"
+    ```
+
+## TELEMT_MAX_BLOCKING_THREADS
+  - **Ограничения / валидация**: `usize`. `0` отвергается.
+  - **Описание**: Размер blocking-пула Tokio. Рассчитан на DNS-резолюции (`getaddrinfo`), файловые операции и несколько внутренних `spawn_blocking`-точек. Увеличьте, если у вас много одновременных DNS-резолюций (например, большой `mask_hosts` + резолюция на каждое рукопожатие). По умолчанию `1024`.
+  - **Пример (systemd unit)**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_MAX_BLOCKING_THREADS=2048"
+    ```
+
+## TELEMT_ACCEPT_SHARDS
+  - **Ограничения / валидация**: `usize > 0`.
+  - **Описание**: Число userspace accept-задач на listener. Каждая задача читает из общего `TcpListener` и берёт permit'ы из per-shard `Semaphore`'а в рамках бюджета `max_connections`. По умолчанию `num_cpus / listener_count`, не меньше `1`. Когда активен `TELEMT_KERNEL_REUSEPORT_SHARDS`, значение принудительно сбрасывается в `1`, так как kernel уже распределяет SYN'ы между `N` сокетами. См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §§1bis.1, 1bis.2.
+  - **Пример**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_ACCEPT_SHARDS=8"
+    ```
+
+## TELEMT_KERNEL_REUSEPORT_SHARDS
+  - **Ограничения / валидация**: `usize > 0`. Только Linux/Android — на macOS/BSD/Windows значение игнорируется и биндится один сокет.
+  - **Описание**: Биндит **N независимых TCP-сокетов** к одной паре `(ip, port)` с `SO_REUSEPORT=1`. На Linux/Android kernel хэширует входящие SYN'ы между `N` сокетами, устраняя единственный `accept()`-системный вызов как точку сериализации. Логируется при старте как `Listening on <addr> (N SO_REUSEPORT-sharded sockets)`. По умолчанию выключено — включайте на хостах с ≥16 vCPU под высокой скоростью соединений. См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.1.
+  - **Пример**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_KERNEL_REUSEPORT_SHARDS=8"
+    ```
+
+## TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO
+  - **Ограничения / валидация**: presence-only (любое непустое значение включает).
+  - **Описание**: Шорткат для `TELEMT_KERNEL_REUSEPORT_SHARDS = min(num_cpus, 32)`. Игнорируется, если задан и `TELEMT_KERNEL_REUSEPORT_SHARDS`.
+  - **Пример**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO=1"
+    ```
+
+## TELEMT_IPTRACKER_SHARDS
+  - **Ограничения / валидация**: `usize > 0`, округляется до следующей степени двойки, клампится в `[1, 1024]`. Значения, не являющиеся степенью двойки, принимаются с `debug!`-логом, объясняющим округление.
+  - **Описание**: Число шардов `UserIpTracker`'а — это per-user accept/disconnect admission-gate. По умолчанию `32`; на хостах с ≥64 vCPU и очень высоким churn'ом `(user, IP)` ставьте `64` или `128`. Каждый шард — это `parking_lot::Mutex<UserIpShardSlot>` с обеими картами (`active` и `recent`) для ключей `(user, ip)`, попадающих в этот шард. См. `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.3.
+  - **Пример**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_IPTRACKER_SHARDS=64"
+    ```
+
+## TELEMT_MIDDLE_RELAY_MERGED_TASKS
+  - **Ограничения / валидация**: presence-only. Принимаются `1`, `true`, `TRUE`, `yes`, `on` как «включено»; всё остальное (включая unset, `0`, `false`, `no`, `off`) трактуется как выключенное.
+  - **Описание**: Hook под будущую **merged-tasks** топологию middle-relay'я, которая снизит число задач на соединение с 3 до 2. Сегодня флаг **распознаётся** и при установке выдаёт один `warn!`-лог при старте, но рантайм продолжает использовать legacy-трёхзадачную топологию: полная переработка `tokio::select!`-петли зарезервирована до релиза, который включит нагрузочные тесты, описанные в `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.7. Операторам, желающим merged-tasks, следует дождаться следующего PR, который флипнет дефолт.
+  - **Пример**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_MIDDLE_RELAY_MERGED_TASKS=1"
     ```

@@ -2395,17 +2395,24 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
 | [`tls_fetch`](#tls_fetch) | `Table` | built-in defaults | `✘` |
 | [`mask`](#mask) | `bool` | `true` | `✘` |
 | [`mask_host`](#mask_host) | `String` | — | `✘` |
+| [`mask_hosts`](#mask_hosts) | `String[]` | `[]` | `✘` |
+| [`mask_host_by_sni`](#mask_host_by_sni) | `Table<String, String>` | `{}` | `✘` |
 | [`mask_port`](#mask_port) | `u16` | `443` | `✘` |
 | [`mask_unix_sock`](#mask_unix_sock) | `String` | — | `✘` |
 | [`fake_cert_len`](#fake_cert_len) | `usize` | `2048` | `✘` |
 | [`tls_emulation`](#tls_emulation) | `bool` | `true` | `✘` |
 | [`tls_front_dir`](#tls_front_dir) | `String` | `"tlsfront"` | `✘` |
-| [`server_hello_delay_min_ms`](#server_hello_delay_min_ms) | `u64` | `0` | `✘` |
-| [`server_hello_delay_max_ms`](#server_hello_delay_max_ms) | `u64` | `0` | `✘` |
+| [`server_hello_delay_min_ms`](#server_hello_delay_min_ms) | `u64` | `8` | `✘` |
+| [`server_hello_delay_max_ms`](#server_hello_delay_max_ms) | `u64` | `24` | `✘` |
 | [`tls_new_session_tickets`](#tls_new_session_tickets) | `u8` | `0` | `✘` |
 | [`tls_full_cert_ttl_secs`](#tls_full_cert_ttl_secs) | `u64` | `90` | `✘` |
 | [`serverhello_compact`](#serverhello_compact) | `bool` | `false` | `✘` |
+| [`cipher_suites_pool`](#cipher_suites_pool) | `u16[]` | `[0x1301, 0x1302, 0x1303]` | `✘` |
+| [`extension_order_randomize`](#extension_order_randomize) | `bool` | `true` | `✘` |
 | [`alpn_enforce`](#alpn_enforce) | `bool` | `true` | `✘` |
+| [`alpn_profiles`](#alpn_profiles) | `String[][]` | `[["h2","http/1.1"], ["http/1.1"]]` | `✘` |
+| [`alpn_profile_bucket_secs`](#alpn_profile_bucket_secs) | `u64` | `86400` | `✘` |
+| [`ech_log_observed`](#ech_log_observed) | `bool` | `false` | `✘` |
 | [`mask_proxy_protocol`](#mask_proxy_protocol) | `u8` | `0` | `✘` |
 | [`mask_shape_hardening`](#mask_shape_hardening) | `bool` | `true` | `✘` |
 | [`mask_shape_hardening_aggressive_mode`](#mask_shape_hardening_aggressive_mode) | `bool` | `false` | `✘` |
@@ -2487,12 +2494,41 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
   - **Constraints / validation**: `String` (optional).
     - If `mask_unix_sock` is set, `mask_host` must be omitted (mutually exclusive).
     - If `mask_host` is not set and `mask_unix_sock` is not set, Telemt defaults `mask_host` to `tls_domain`.
+    - Acts as the legacy *single* mask backend. When `mask_hosts` or `mask_host_by_sni` is non-empty, those take precedence (see selection precedence below).
   - **Description**: Upstream mask host for TLS fronting relay.
   - **Example**:
 
     ```toml
     [censorship]
     mask_host = "www.cloudflare.com"
+    ```
+## mask_hosts
+  - **Constraints / validation**: `String[]`. Each entry must be a non-empty hostname or IP. When non-empty, supersedes the legacy single-`mask_host` selection.
+  - **Description**: Pool of candidate mask hosts. The proxy distributes clients across the pool deterministically by `hash(peer_ip) % len(mask_hosts)`, so a given client always lands on the same backend within its session (handshake retransmit safe). Distinct clients spread across the pool, eliminating the single-backend flow-concentration fingerprint.
+
+    **Selection precedence**:
+    1. If `mask_host_by_sni` contains a key matching the client SNI (case-insensitive), the mapped host wins.
+    2. Otherwise, if `mask_hosts` is non-empty, pick `mask_hosts[hash(peer_ip) % len(mask_hosts)]`.
+    3. Otherwise, fall back to legacy logic: explicit `mask_host`, or `tls_domain`-based SNI match against `tls_domains`, or `tls_domain` as the final fallback.
+
+    Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.8.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    mask_hosts = ["github.com", "cloudflare.com", "wikipedia.org"]
+    ```
+## mask_host_by_sni
+  - **Constraints / validation**: `Table<String, String>` mapping inbound SNI → mask host. Keys are matched case-insensitively. Values must resolve to a real backend on `mask_port`.
+  - **Description**: Optional explicit per-SNI override of the mask host. A hit here beats the `mask_hosts` hash distribution and the legacy `mask_host` fallback. Useful when an operator wants `cloudflare.com`-fronted handshakes to terminate at a real Cloudflare endpoint, `github.com`-fronted at GitHub, etc., for maximum domain-fronting authenticity.
+
+    Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.8.
+  - **Example**:
+
+    ```toml
+    [censorship.mask_host_by_sni]
+    "cloudflare.com" = "cloudflare.com"
+    "github.com"     = "github.com"
     ```
 ## mask_port
   - **Constraints / validation**: `u16`.
@@ -2544,17 +2580,17 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     tls_front_dir = "tlsfront"
     ```
 ## server_hello_delay_min_ms
-  - **Constraints / validation**: `u64` (milliseconds).
-  - **Description**: Minimum `server_hello` delay for anti-fingerprint behavior (ms).
+  - **Constraints / validation**: `u64` (milliseconds). Default `8`.
+  - **Description**: Minimum `server_hello` delay for anti-fingerprint behavior (ms). When `server_hello_delay_max_ms > server_hello_delay_min_ms`, an actual delay value is drawn from a **log-normal** distribution bounded to `[min, max]` — this more faithfully reproduces the long-tail latency profile of real TLS handshakes than a uniform jitter. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.4.
   - **Example**:
 
     ```toml
     [censorship]
-    server_hello_delay_min_ms = 0
+    server_hello_delay_min_ms = 8
     ```
 ## server_hello_delay_max_ms
-  - **Constraints / validation**: `u64` (milliseconds). Must be \(<\) `timeouts.client_handshake * 1000`.
-  - **Description**: Maximum `server_hello` delay for anti-fingerprint behavior (ms).
+  - **Constraints / validation**: `u64` (milliseconds). Must be \(<\) `timeouts.client_handshake * 1000`. Default `24`.
+  - **Description**: Maximum `server_hello` delay for anti-fingerprint behavior (ms). Set both `min`/`max` to `0` to disable jitter entirely.
   - **Example**:
 
     ```toml
@@ -2562,7 +2598,7 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     client_handshake = 30
 
     [censorship]
-    server_hello_delay_max_ms = 0
+    server_hello_delay_max_ms = 24
     ```
 ## tls_new_session_tickets
   - **Constraints / validation**: `u8`.
@@ -2591,6 +2627,26 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     [censorship]
     serverhello_compact = false
     ```
+## cipher_suites_pool
+  - **Constraints / validation**: `u16[]`. Each value is a TLS 1.3 cipher-suite ID (RFC 8446 §B.4). Empty array = use built-in default `[0x1301, 0x1302, 0x1303]`. Setting to `[0x1301, 0x1302]` reproduces the pre-2.2 legacy behavior.
+  - **Description**: Pool of cipher suites the emulated ServerHello may select from when no upstream TLS profile is captured. The choice is derived from a FNV-1a hash of the ClientHello digest, so a given client always sees the same cipher (handshake retransmit safe), but the population spans the whole pool. Defeats the static 2-way JA3-S fingerprint that earlier builds emitted.
+
+    Defaults (in order): AES-128-GCM-SHA256 (`0x1301`), AES-256-GCM-SHA384 (`0x1302`), CHACHA20-POLY1305-SHA256 (`0x1303`) — all MTI per RFC 8446 §B.4. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    cipher_suites_pool = [0x1301, 0x1302, 0x1303]
+    ```
+## extension_order_randomize
+  - **Constraints / validation**: `bool`. Default `true`. Setting to `false` reproduces the pre-2.2 fixed extension ordering (`key_share`, then `supported_versions`).
+  - **Description**: When `true`, the order of reorderable extensions in the emulated ServerHello is permuted deterministically by the ClientHello digest using a Fisher-Yates / xorshift mixer. RFC 8446 §4.2 explicitly permits any ordering for the extensions emitted today (`key_share`, `supported_versions`). The shuffle is digest-keyed so a given client retransmit produces a byte-identical ServerHello. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    extension_order_randomize = true
+    ```
 ## alpn_enforce
   - **Constraints / validation**: `bool`.
   - **Description**: Enforces ALPN echo behavior based on client preference.
@@ -2599,6 +2655,40 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     ```toml
     [censorship]
     alpn_enforce = true
+    ```
+## alpn_profiles
+  - **Constraints / validation**: `String[][]` — outer array is a pool of profiles, each profile is a preference-ordered list of protocol names. Empty outer array disables profile-driven selection and the proxy falls back to the legacy `h2 > http/1.1` echo. Setting to `[["h2","http/1.1"]]` reproduces pre-2.6 legacy behavior exactly for `[h2, http/1.1]` clients.
+  - **Description**: ALPN echo profile pool. For each handshake the proxy picks a profile by `hash(sni || time_bucket) % len(alpn_profiles)`, then echoes the **first profile entry that also appears in the client's offered ALPN list** (RFC 7301 §3.2 intersection). If the intersection is empty for the picked profile, the legacy `h2 > http/1.1 > BadClient` rule kicks in as fallback.
+
+    The default `[["h2","http/1.1"], ["http/1.1"]]` causes roughly half of (SNI, day) tuples to see `http/1.1`-only echo, which breaks the single-ALPN-fingerprint pattern. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.6.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    alpn_profiles = [
+        ["h2", "http/1.1"],
+        ["http/1.1"],
+    ]
+    ```
+## alpn_profile_bucket_secs
+  - **Constraints / validation**: `u64` (seconds). `0` disables the time component — a given SNI is then locked to a single profile choice forever. Default `86400` (one day).
+  - **Description**: Time-bucket size for the SNI-keyed ALPN profile pick. Larger values make per-SNI ALPN behavior more stable over time (better for HTTP/2 connection pooling on observers); smaller values rotate faster. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.6.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    alpn_profile_bucket_secs = 86400
+    ```
+## ech_log_observed
+  - **Constraints / validation**: `bool`. Default `false`.
+  - **Description**: When `true`, emits a `tracing::debug` line whenever an inbound ClientHello carries the `encrypted_client_hello` (ECH, codepoint `0xfe0d`, draft-ietf-tls-esni-22) extension. Useful for measuring how many real clients are sending ECH-bearing handshakes. The flag has no effect on routing — ECH-bearing handshakes naturally fall through the existing `UnknownSniAction` policy (`mask` is recommended so they get forwarded to a real ECH-aware backend). Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.3.
+
+    **Privacy note**: enabling this writes the peer IP and outer SNI to the trace log; review your log retention before flipping it on.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    ech_log_observed = false
     ```
 ## mask_proxy_protocol
   - **Constraints / validation**: `u8`. `0` = disabled, `1` = v1 (text), `2` = v2 (binary).
@@ -3295,4 +3385,94 @@ If your backend or network is very bandwidth-constrained, reduce cap first. If p
     address = "127.0.0.1:9050"
     username = "alice"
     password = "secret"
+    ```
+
+
+# Environment variables (runtime tuning)
+
+Several knobs are deliberately kept out of the TOML schema and read from the
+process environment instead — they govern process-wide runtime topology that
+doesn't change per-connection, and they default to safe values that match the
+historical wire behavior. Operators wire them via the systemd unit's
+`Environment=` lines (the bundled `install.sh` does this for you when the
+variable is set at install time).
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| [`TELEMT_WORKER_THREADS`](#telemt_worker_threads) | `num_cpus` | Tokio worker thread count. |
+| [`TELEMT_MAX_BLOCKING_THREADS`](#telemt_max_blocking_threads) | `1024` | Tokio blocking-pool size. |
+| [`TELEMT_ACCEPT_SHARDS`](#telemt_accept_shards) | `num_cpus / listener_count` | Userspace accept-loop fan-out per listener. |
+| [`TELEMT_KERNEL_REUSEPORT_SHARDS`](#telemt_kernel_reuseport_shards) | unset (= 1, off) | N independent `SO_REUSEPORT` sockets bound to each listener (Linux/Android). |
+| [`TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO`](#telemt_kernel_reuseport_shards_auto) | unset (= off) | If set, auto-pick `min(num_cpus, 32)`. |
+| [`TELEMT_IPTRACKER_SHARDS`](#telemt_iptracker_shards) | `32` | `UserIpTracker` shard count (rounded up to a power of two, clamped to `[1, 1024]`). |
+| [`TELEMT_MIDDLE_RELAY_MERGED_TASKS`](#telemt_middle_relay_merged_tasks) | unset (= off) | Reserved hook for a future merged-tasks middle-relay topology. |
+
+## TELEMT_WORKER_THREADS
+  - **Constraints / validation**: `usize`. `0` is rejected.
+  - **Description**: Number of Tokio worker threads. Higher values raise parallelism on many-core hosts but also raise scheduler overhead. Default is `num_cpus`. Refs `src/main.rs` (runtime builder).
+  - **Example (systemd unit)**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_WORKER_THREADS=16"
+    ```
+
+## TELEMT_MAX_BLOCKING_THREADS
+  - **Constraints / validation**: `usize`. `0` is rejected.
+  - **Description**: Tokio blocking-pool size. Sized to absorb DNS resolutions (`getaddrinfo`), filesystem operations and a few internal `spawn_blocking` callsites. Bump it if your deployment processes many concurrent DNS lookups (e.g. heavy `mask_hosts` + per-handshake resolution). Default `1024`.
+  - **Example (systemd unit)**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_MAX_BLOCKING_THREADS=2048"
+    ```
+
+## TELEMT_ACCEPT_SHARDS
+  - **Constraints / validation**: `usize > 0`.
+  - **Description**: Number of userspace accept tasks per listener. Each accept task reads from the shared `TcpListener` and bumps a per-shard `Semaphore` of the `max_connections` budget. Default is `num_cpus / listener_count`, capped to `≥ 1`. When `TELEMT_KERNEL_REUSEPORT_SHARDS` is active, this is forced to `1` because the kernel already distributes incoming SYNs across `N` sockets. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §§1bis.1, 1bis.2.
+  - **Example**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_ACCEPT_SHARDS=8"
+    ```
+
+## TELEMT_KERNEL_REUSEPORT_SHARDS
+  - **Constraints / validation**: `usize > 0`. Linux/Android only — on macOS/BSD/Windows the value is ignored and a single socket is bound.
+  - **Description**: Binds **N independent TCP sockets** to the same `(ip, port)` with `SO_REUSEPORT=1`. On Linux/Android the kernel hashes incoming SYNs across the `N` sockets, eliminating the single-`accept()` syscall as the serialization point. Logged at startup as `Listening on <addr> (N SO_REUSEPORT-sharded sockets)`. Off by default; opt in for hosts with ≥16 vCPUs under heavy connect rate. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.1.
+  - **Example**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_KERNEL_REUSEPORT_SHARDS=8"
+    ```
+
+## TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO
+  - **Constraints / validation**: presence-only (any non-empty value enables).
+  - **Description**: Shortcut for `TELEMT_KERNEL_REUSEPORT_SHARDS = min(num_cpus, 32)`. Ignored when `TELEMT_KERNEL_REUSEPORT_SHARDS` is also set.
+  - **Example**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO=1"
+    ```
+
+## TELEMT_IPTRACKER_SHARDS
+  - **Constraints / validation**: `usize > 0`, rounded up to the next power of two, clamped to `[1, 1024]`. Non-power-of-two values are accepted with a `debug!` log explaining the round-up.
+  - **Description**: Shard count for `UserIpTracker` — the per-user accept/disconnect admission gate. Default `32`; on hosts with ≥64 vCPUs and very high `(user, IP)` churn, set to `64` or `128`. Each shard is a `parking_lot::Mutex<UserIpShardSlot>` holding both `active` and `recent` maps for the `(user, ip)` keys it owns. Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.3.
+  - **Example**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_IPTRACKER_SHARDS=64"
+    ```
+
+## TELEMT_MIDDLE_RELAY_MERGED_TASKS
+  - **Constraints / validation**: presence-only. Accepts `1`, `true`, `TRUE`, `yes`, `on` as affirmative; anything else (including unset, `0`, `false`, `no`, `off`) is treated as off.
+  - **Description**: Future-extension hook for the **merged-tasks** middle-relay topology that would reduce per-connection task count from 3 to 2. The flag is **recognised** today and a single `warn!` line is emitted at startup if set, but the runtime continues to use the legacy three-task topology because the full `tokio::select!`-loop rewrite is reserved for a release that includes the load tests called out in `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.7. Operators wanting merged-tasks behavior should wait for the follow-up PR that flips this flag's default.
+  - **Example**:
+
+    ```ini
+    [Service]
+    Environment="TELEMT_MIDDLE_RELAY_MERGED_TASKS=1"
     ```
