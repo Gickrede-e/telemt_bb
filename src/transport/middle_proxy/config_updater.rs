@@ -549,6 +549,7 @@ pub async fn me_config_updater(
                     cfg.general.me_adaptive_floor_idle_secs,
                     cfg.general.me_adaptive_floor_min_writers_single_endpoint,
                     cfg.general.me_adaptive_floor_min_writers_multi_endpoint,
+                    cfg.general.me_writer_bind_multiplier,
                     cfg.general.me_adaptive_floor_recover_grace_secs,
                     cfg.general.me_adaptive_floor_writers_per_core_total,
                     cfg.general.me_adaptive_floor_cpu_cores_override,

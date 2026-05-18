@@ -117,6 +117,7 @@ const GENERAL_CONFIG_KEYS: &[&str] = &[
     "me_adaptive_floor_idle_secs",
     "me_adaptive_floor_min_writers_single_endpoint",
     "me_adaptive_floor_min_writers_multi_endpoint",
+    "me_writer_bind_multiplier",
     "me_adaptive_floor_recover_grace_secs",
     "me_adaptive_floor_writers_per_core_total",
     "me_adaptive_floor_cpu_cores_override",
@@ -1590,6 +1591,14 @@ impl ProxyConfig {
             return Err(ProxyError::Config(
                 "general.me_adaptive_floor_min_writers_multi_endpoint must be within [1, 32]"
                     .to_string(),
+            ));
+        }
+
+        if config.general.me_writer_bind_multiplier == 0
+            || config.general.me_writer_bind_multiplier > 32
+        {
+            return Err(ProxyError::Config(
+                "general.me_writer_bind_multiplier must be within [1, 32]".to_string(),
             ));
         }
 

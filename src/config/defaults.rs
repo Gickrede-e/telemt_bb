@@ -379,6 +379,13 @@ pub(crate) fn default_me_adaptive_floor_min_writers_multi_endpoint() -> u8 {
     DEFAULT_ME_ADAPTIVE_FLOOR_MIN_WRITERS_MULTI_ENDPOINT
 }
 
+/// Multiplier for per-DC writer count when paired with multi-IP
+/// `[[upstreams]].bind_addresses`. Defaults to 1 (no change).
+/// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B.
+pub(crate) fn default_me_writer_bind_multiplier() -> u32 {
+    1
+}
+
 pub(crate) fn default_me_adaptive_floor_recover_grace_secs() -> u64 {
     DEFAULT_ME_ADAPTIVE_FLOOR_RECOVER_GRACE_SECS
 }

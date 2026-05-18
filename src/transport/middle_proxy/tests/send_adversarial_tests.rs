@@ -64,6 +64,7 @@ async fn make_pool() -> (Arc<MePool>, Arc<SecureRandom>) {
         general.me_adaptive_floor_idle_secs,
         general.me_adaptive_floor_min_writers_single_endpoint,
         general.me_adaptive_floor_min_writers_multi_endpoint,
+        general.me_writer_bind_multiplier,
         general.me_adaptive_floor_recover_grace_secs,
         general.me_adaptive_floor_writers_per_core_total,
         general.me_adaptive_floor_cpu_cores_override,

@@ -241,6 +241,7 @@ pub(crate) async fn initialize_me_pool(
                     config.general.me_adaptive_floor_idle_secs,
                     config.general.me_adaptive_floor_min_writers_single_endpoint,
                     config.general.me_adaptive_floor_min_writers_multi_endpoint,
+                    config.general.me_writer_bind_multiplier,
                     config.general.me_adaptive_floor_recover_grace_secs,
                     config.general.me_adaptive_floor_writers_per_core_total,
                     config.general.me_adaptive_floor_cpu_cores_override,
