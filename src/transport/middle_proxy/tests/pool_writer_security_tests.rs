@@ -58,6 +58,7 @@ async fn make_pool() -> Arc<MePool> {
         general.me_adaptive_floor_idle_secs,
         general.me_adaptive_floor_min_writers_single_endpoint,
         general.me_adaptive_floor_min_writers_multi_endpoint,
+        general.me_writer_bind_multiplier,
         general.me_adaptive_floor_recover_grace_secs,
         general.me_adaptive_floor_writers_per_core_total,
         general.me_adaptive_floor_cpu_cores_override,
@@ -464,4 +465,70 @@ async fn stress_parallel_duplicate_removals_are_idempotent() {
 
     assert!(pool.writers.read().await.is_empty());
     assert_eq!(pool.conn_count.load(Ordering::Relaxed), 0);
+}
+
+// ============================================================================
+// me_writer_bind_multiplier — Path B for multi-IP outbound scaling.
+// Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §B.
+//
+// When operator sets `me_writer_bind_multiplier = N` alongside
+// `[[upstreams]].bind_addresses` of length N, `required_writers_for_dc` must
+// return `base × N`, so that the existing round-robin source-IP rotation
+// produces N writers per source IP (i.e. N × base writers per DC). With N=1
+// the behaviour is byte-identical to before this feature existed.
+// ============================================================================
+
+#[tokio::test]
+async fn writer_bind_multiplier_default_one_is_no_op() {
+    let pool = make_pool().await;
+    assert_eq!(pool.writer_bind_multiplier(), 1);
+    // Single endpoint, default shadow=0 -> base = max(1+0, 3) = 3.
+    assert_eq!(pool.required_writers_for_dc(1), 3);
+    // Multi-endpoint base = max(endpoint_count, 3).
+    assert_eq!(pool.required_writers_for_dc(2), 3);
+    assert_eq!(pool.required_writers_for_dc(7), 7);
+    assert_eq!(pool.required_writers_for_dc(0), 0);
+}
+
+#[tokio::test]
+async fn writer_bind_multiplier_six_multiplies_base() {
+    let pool = make_pool().await;
+    // Hot-reload-style update to multiplier = 6 (matching 6 bind_addresses).
+    pool.floor_runtime
+        .me_writer_bind_multiplier
+        .store(6, Ordering::Relaxed);
+    assert_eq!(pool.writer_bind_multiplier(), 6);
+
+    // Single-endpoint DC: base=3 → 3×6 = 18 writers.
+    assert_eq!(pool.required_writers_for_dc(1), 18);
+    // Multi-endpoint DC (10 endpoints): base=10 → 10×6 = 60.
+    assert_eq!(pool.required_writers_for_dc(10), 60);
+    // Empty DC stays at 0 (no spurious writers when there are no endpoints).
+    assert_eq!(pool.required_writers_for_dc(0), 0);
+}
+
+#[tokio::test]
+async fn writer_bind_multiplier_zero_is_treated_as_one() {
+    // Validators clamp this in production; defence-in-depth ensures the
+    // pool never returns 0 writers for a DC with endpoints.
+    let pool = make_pool().await;
+    pool.floor_runtime
+        .me_writer_bind_multiplier
+        .store(0, Ordering::Relaxed);
+    assert_eq!(pool.writer_bind_multiplier(), 1);
+    assert_eq!(pool.required_writers_for_dc(1), 3);
+}
+
+#[tokio::test]
+async fn writer_bind_multiplier_saturates_on_overflow() {
+    // Saturating arithmetic guards against absurd multipliers — config
+    // validator caps at 32, but defence-in-depth covers any caller bypassing
+    // it through direct atomic store (hot-reload / tests). Force overflow on
+    // 64-bit usize by combining usize::MAX endpoints with u32::MAX multiplier.
+    let pool = make_pool().await;
+    pool.floor_runtime
+        .me_writer_bind_multiplier
+        .store(u32::MAX, Ordering::Relaxed);
+    let n = pool.required_writers_for_dc(usize::MAX);
+    assert_eq!(n, usize::MAX, "must saturate without panic");
 }

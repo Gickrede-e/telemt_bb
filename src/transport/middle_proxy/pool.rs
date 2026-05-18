@@ -365,6 +365,15 @@ pub(super) struct FloorRuntimeCore {
     pub(super) me_adaptive_floor_idle_secs: AtomicU64,
     pub(super) me_adaptive_floor_min_writers_single_endpoint: AtomicU8,
     pub(super) me_adaptive_floor_min_writers_multi_endpoint: AtomicU8,
+    /// Multiplier for per-DC writer count, paired with multi-IP outbound
+    /// `[[upstreams]].bind_addresses`. When > 1, the per-DC writer count
+    /// (`required_writers_for_dc`) is multiplied by this value so that the
+    /// round-robin source-IP rotation in `resolve_bind_address` produces
+    /// `M × required_writers` connections per DC, spreading them across
+    /// `M` distinct source IPs. Operators with N public IPs set this to N.
+    /// Validated to `[1, 32]` at config load.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B.
+    pub(super) me_writer_bind_multiplier: AtomicU32,
     pub(super) me_adaptive_floor_recover_grace_secs: AtomicU64,
     pub(super) me_adaptive_floor_writers_per_core_total: AtomicU32,
     pub(super) me_adaptive_floor_cpu_cores_override: AtomicU32,
@@ -517,6 +526,7 @@ impl MePool {
         me_adaptive_floor_idle_secs: u64,
         me_adaptive_floor_min_writers_single_endpoint: u8,
         me_adaptive_floor_min_writers_multi_endpoint: u8,
+        me_writer_bind_multiplier: u32,
         me_adaptive_floor_recover_grace_secs: u64,
         me_adaptive_floor_writers_per_core_total: u16,
         me_adaptive_floor_cpu_cores_override: u16,
@@ -736,6 +746,7 @@ impl MePool {
                 me_adaptive_floor_min_writers_multi_endpoint: AtomicU8::new(
                     me_adaptive_floor_min_writers_multi_endpoint,
                 ),
+                me_writer_bind_multiplier: AtomicU32::new(me_writer_bind_multiplier.max(1)),
                 me_adaptive_floor_recover_grace_secs: AtomicU64::new(
                     me_adaptive_floor_recover_grace_secs,
                 ),
@@ -1039,6 +1050,7 @@ impl MePool {
         adaptive_floor_idle_secs: u64,
         adaptive_floor_min_writers_single_endpoint: u8,
         adaptive_floor_min_writers_multi_endpoint: u8,
+        writer_bind_multiplier: u32,
         adaptive_floor_recover_grace_secs: u64,
         adaptive_floor_writers_per_core_total: u16,
         adaptive_floor_cpu_cores_override: u16,
@@ -1158,6 +1170,9 @@ impl MePool {
         self.floor_runtime
             .me_adaptive_floor_min_writers_multi_endpoint
             .store(adaptive_floor_min_writers_multi_endpoint, Ordering::Relaxed);
+        self.floor_runtime
+            .me_writer_bind_multiplier
+            .store(writer_bind_multiplier.max(1), Ordering::Relaxed);
         self.floor_runtime
             .me_adaptive_floor_recover_grace_secs
             .store(adaptive_floor_recover_grace_secs, Ordering::Relaxed);
@@ -1416,18 +1431,36 @@ impl MePool {
             .clamp(2, 4) as usize
     }
 
+    /// Multiplier applied to every per-DC writer count to spread writers
+    /// across the source-IP pool in `[[upstreams]].bind_addresses`.
+    /// Always returns at least 1. See `me_writer_bind_multiplier`.
+    pub(super) fn writer_bind_multiplier(&self) -> usize {
+        (self
+            .floor_runtime
+            .me_writer_bind_multiplier
+            .load(Ordering::Relaxed) as usize)
+            .max(1)
+    }
+
     pub(super) fn required_writers_for_dc(&self, endpoint_count: usize) -> usize {
         if endpoint_count == 0 {
             return 0;
         }
-        if endpoint_count == 1 {
+        let base = if endpoint_count == 1 {
             let shadow = self
                 .single_endpoint_runtime
                 .me_single_endpoint_shadow_writers
                 .load(Ordering::Relaxed) as usize;
-            return (1 + shadow).max(3);
-        }
-        endpoint_count.max(3)
+            (1 + shadow).max(3)
+        } else {
+            endpoint_count.max(3)
+        };
+        // Multiply by per-IP multiplier so that round-robin source-IP
+        // rotation in `resolve_bind_address` ends up with
+        // `multiplier × required_writers` connections, evenly spread across
+        // the configured bind_addresses pool. Multiplier defaults to 1
+        // (no-op for single-IP setups).
+        base.saturating_mul(self.writer_bind_multiplier())
     }
 
     pub(super) fn floor_mode(&self) -> MeFloorMode {

@@ -661,6 +661,17 @@ pub struct GeneralConfig {
     #[serde(default = "default_me_adaptive_floor_min_writers_multi_endpoint")]
     pub me_adaptive_floor_min_writers_multi_endpoint: u8,
 
+    /// Multiplier for per-DC writer count, paired with multi-IP outbound
+    /// `[[upstreams]].bind_addresses`. When > 1, every per-DC writer count
+    /// computed from `endpoint_count` / adaptive floor is multiplied by this
+    /// value; combined with round-robin source-IP rotation in
+    /// `resolve_bind_address`, this gives `M × required_writers` connections
+    /// per DC where `M` = number of distinct source IPs. Operators with N
+    /// public IPs typically set this to N. Defaults to 1 (no change). Max 32.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B.
+    #[serde(default = "default_me_writer_bind_multiplier")]
+    pub me_writer_bind_multiplier: u32,
+
     /// Grace period in seconds to hold static floor after activity in adaptive mode.
     #[serde(default = "default_me_adaptive_floor_recover_grace_secs")]
     pub me_adaptive_floor_recover_grace_secs: u64,
@@ -1060,6 +1071,7 @@ impl Default for GeneralConfig {
                 default_me_adaptive_floor_min_writers_single_endpoint(),
             me_adaptive_floor_min_writers_multi_endpoint:
                 default_me_adaptive_floor_min_writers_multi_endpoint(),
+            me_writer_bind_multiplier: default_me_writer_bind_multiplier(),
             me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
             me_adaptive_floor_writers_per_core_total:
                 default_me_adaptive_floor_writers_per_core_total(),
