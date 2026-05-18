@@ -315,6 +315,20 @@ const CENSORSHIP_CONFIG_KEYS: &[&str] = &[
     "mask_timing_normalization_enabled",
     "mask_timing_normalization_floor_ms",
     "mask_timing_normalization_ceiling_ms",
+    // PR #3 anti-detect additions. The fields are recognised by serde via
+    // `#[serde(default)]` on `AntiCensorshipConfig`, but this loader runs a
+    // separate "unknown key" walker that needs an explicit whitelist; without
+    // these entries every operator using the new fields gets a spurious
+    // `Unknown config key ignored key=censorship.<field>` warning at startup
+    // and config_strict=true would refuse to load.
+    // Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §§2.2, 2.3, 2.6, 2.8.
+    "ech_log_observed",
+    "cipher_suites_pool",
+    "extension_order_randomize",
+    "alpn_profiles",
+    "alpn_profile_bucket_secs",
+    "mask_hosts",
+    "mask_host_by_sni",
 ];
 
 const TLS_FETCH_CONFIG_KEYS: &[&str] = &[
@@ -4175,5 +4189,67 @@ mod tests {
         let cfg = ProxyConfig::load(&path).unwrap();
         assert_eq!(cfg.network.dns_overrides.len(), 2);
         let _ = std::fs::remove_file(path);
+    }
+
+    // === PR #3 follow-up: every anti-detect field added to AntiCensorshipConfig
+    // also has to live in CENSORSHIP_CONFIG_KEYS so the loader's unknown-key
+    // walker doesn't spuriously warn — AND so config_strict=true accepts them.
+    // Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §§2.2, 2.3, 2.6, 2.8.
+
+    #[test]
+    fn censorship_anti_detect_keys_pass_unknown_key_walker() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            [censorship]
+            ech_log_observed = true
+            cipher_suites_pool = [0x1301, 0x1302, 0x1303]
+            extension_order_randomize = true
+            alpn_profiles = [["h2", "http/1.1"], ["http/1.1"]]
+            alpn_profile_bucket_secs = 86400
+            mask_hosts = ["a.example", "b.example"]
+
+            [censorship.mask_host_by_sni]
+            "a.example" = "a.example"
+            "b.example" = "b.example"
+        "#,
+        )
+        .expect("anti-detect TOML must parse");
+
+        let unknown = collect_unknown_config_keys(&toml);
+        assert!(
+            unknown.is_empty(),
+            "expected zero unknown keys, got: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn censorship_anti_detect_keys_load_under_strict_mode() {
+        let toml = r#"
+            [general]
+            config_strict = true
+
+            [censorship]
+            ech_log_observed = true
+            cipher_suites_pool = [0x1301, 0x1302]
+            extension_order_randomize = false
+            alpn_profiles = [["h2", "http/1.1"]]
+            alpn_profile_bucket_secs = 3600
+            mask_hosts = ["x.example"]
+
+            [censorship.mask_host_by_sni]
+            "x.example" = "x.example"
+        "#;
+        // Load through the full pipeline (this will call handle_unknown_config_keys
+        // internally and return Err when any unknown key is present under strict).
+        let cfg = load_config_from_temp_toml(toml);
+        assert!(cfg.censorship.ech_log_observed);
+        assert_eq!(cfg.censorship.cipher_suites_pool, vec![0x1301, 0x1302]);
+        assert!(!cfg.censorship.extension_order_randomize);
+        assert_eq!(cfg.censorship.alpn_profile_bucket_secs, 3600);
+        assert_eq!(cfg.censorship.mask_hosts, vec!["x.example".to_string()]);
+        assert_eq!(
+            cfg.censorship.mask_host_by_sni.get("x.example"),
+            Some(&"x.example".to_string())
+        );
     }
 }
