@@ -7,6 +7,22 @@ REPO="${REPO:-Gickrede-e/telemt_bb}"
 BRANCH="${BRANCH:-main}"
 BUILD_FROM_SOURCE="${BUILD_FROM_SOURCE:-0}"
 BIN_NAME="${BIN_NAME:-telemt}"
+
+# Optional runtime tuning knobs propagated into the generated systemd /
+# OpenRC unit when set at install time. Empty value = omit the line so the
+# binary keeps its built-in default. Refs:
+#   * docs/PERFORMANCE_AND_ANTIDETECT.ru.md
+#   * src/maestro/listeners.rs::{accept_shards_per_listener,accept_shards_kernel}
+#   * src/ip_tracker.rs (TELEMT_IPTRACKER_SHARDS)
+#   * src/proxy/middle_relay.rs (TELEMT_MIDDLE_RELAY_MERGED_TASKS)
+#   * src/main.rs (TELEMT_WORKER_THREADS, TELEMT_MAX_BLOCKING_THREADS)
+TELEMT_WORKER_THREADS="${TELEMT_WORKER_THREADS:-}"
+TELEMT_MAX_BLOCKING_THREADS="${TELEMT_MAX_BLOCKING_THREADS:-}"
+TELEMT_ACCEPT_SHARDS="${TELEMT_ACCEPT_SHARDS:-}"
+TELEMT_KERNEL_REUSEPORT_SHARDS="${TELEMT_KERNEL_REUSEPORT_SHARDS:-}"
+TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO="${TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO:-}"
+TELEMT_IPTRACKER_SHARDS="${TELEMT_IPTRACKER_SHARDS:-}"
+TELEMT_MIDDLE_RELAY_MERGED_TASKS="${TELEMT_MIDDLE_RELAY_MERGED_TASKS:-}"
 INSTALL_DIR="${INSTALL_DIR:-/bin}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/telemt}"
 CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/telemt.toml}"
@@ -321,6 +337,16 @@ show_help() {
         say "  BRANCH=name                Ветка для сборки при fallback (по умолчанию: ${BRANCH})"
         say "  BUILD_FROM_SOURCE=1        Пропустить попытку скачивания, сразу собрать (требует git и cargo)"
         say "  INSTALL_DIR, CONFIG_DIR    Куда установить бинарь и конфиг"
+        say ""
+        say "Тюнинг runtime'а (пишутся в systemd/OpenRC unit при установке):"
+        say "  TELEMT_WORKER_THREADS=N            Число tokio worker-тредов"
+        say "  TELEMT_MAX_BLOCKING_THREADS=N      Размер blocking-пула"
+        say "  TELEMT_ACCEPT_SHARDS=N             Userspace accept-task'ов на listener"
+        say "  TELEMT_KERNEL_REUSEPORT_SHARDS=N   N сокетов с SO_REUSEPORT (Linux/Android)"
+        say "  TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO=1  Auto = min(num_cpus, 32)"
+        say "  TELEMT_IPTRACKER_SHARDS=N          Шардов в UserIpTracker (степень двойки)"
+        say "  TELEMT_MIDDLE_RELAY_MERGED_TASKS=1 (зарезервировано под будущий релиз)"
+        say "  См. docs/PERFORMANCE_AND_ANTIDETECT.ru.md"
     else
         say "Usage: $0 [ <version> | install | uninstall | purge ] [ options ]"
         say "  <version>    Install specific version (e.g. 3.3.15, default: latest)"
@@ -340,6 +366,16 @@ show_help() {
         say "  BRANCH=name                Branch used by the build fallback (default: ${BRANCH})"
         say "  BUILD_FROM_SOURCE=1        Skip download and build from source (requires git and cargo)"
         say "  INSTALL_DIR, CONFIG_DIR    Where to install the binary and config"
+        say ""
+        say "Runtime tuning (baked into the systemd/OpenRC unit at install time):"
+        say "  TELEMT_WORKER_THREADS=N            tokio worker thread count"
+        say "  TELEMT_MAX_BLOCKING_THREADS=N      blocking-pool size"
+        say "  TELEMT_ACCEPT_SHARDS=N             userspace accept tasks per listener"
+        say "  TELEMT_KERNEL_REUSEPORT_SHARDS=N   N SO_REUSEPORT sockets (Linux/Android)"
+        say "  TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO=1  auto = min(num_cpus, 32)"
+        say "  TELEMT_IPTRACKER_SHARDS=N          UserIpTracker shard count (power of two)"
+        say "  TELEMT_MIDDLE_RELAY_MERGED_TASKS=1 (reserved for a future release)"
+        say "  See docs/PERFORMANCE_AND_ANTIDETECT.ru.md"
     fi
     exit 0
 }
@@ -727,7 +763,24 @@ install_config() {
     say "  -> $L_INFO_CONF_SEC $USER_SECRET"
 }
 
+# Emit a systemd `Environment=KEY=value` line for each TELEMT_* tuning env
+# var that was set at install time. Empty values are skipped so the binary
+# keeps its built-in default. Values are quoted to survive shell expansion
+# inside the unit file.
+emit_systemd_environment_lines() {
+    for _name in TELEMT_WORKER_THREADS TELEMT_MAX_BLOCKING_THREADS \
+                 TELEMT_ACCEPT_SHARDS TELEMT_KERNEL_REUSEPORT_SHARDS \
+                 TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO TELEMT_IPTRACKER_SHARDS \
+                 TELEMT_MIDDLE_RELAY_MERGED_TASKS; do
+        _val="$(eval "printf '%s' \"\${$_name}\"")"
+        if [ -n "$_val" ]; then
+            printf 'Environment="%s=%s"\n' "$_name" "$_val"
+        fi
+    done
+}
+
 generate_systemd_content() {
+    _env_lines="$(emit_systemd_environment_lines)"
     cat <<EOF
 [Unit]
 Description=Telemt
@@ -739,6 +792,7 @@ Type=simple
 User=telemt
 Group=telemt
 WorkingDirectory=$WORK_DIR
+$_env_lines
 ExecStart="${INSTALL_DIR}/${BIN_NAME}" "${CONFIG_FILE}"
 Restart=on-failure
 RestartSec=5
@@ -751,7 +805,27 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Emit OpenRC-friendly `export KEY=value` lines for each TELEMT_* tuning
+# env var that was set at install time. OpenRC inherits exports from the
+# init script's shell, so prefixing the run with them is the canonical way
+# to propagate runtime knobs.
+emit_openrc_environment_exports() {
+    for _name in TELEMT_WORKER_THREADS TELEMT_MAX_BLOCKING_THREADS \
+                 TELEMT_ACCEPT_SHARDS TELEMT_KERNEL_REUSEPORT_SHARDS \
+                 TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO TELEMT_IPTRACKER_SHARDS \
+                 TELEMT_MIDDLE_RELAY_MERGED_TASKS; do
+        _val="$(eval "printf '%s' \"\${$_name}\"")"
+        if [ -n "$_val" ]; then
+            # Strip any embedded double quotes; values are validated by the
+            # binary at parse time so we just need shell-safe printing.
+            _val_safe="$(printf '%s' "$_val" | tr -d '"')"
+            printf 'export %s="%s"\n' "$_name" "$_val_safe"
+        fi
+    done
+}
+
 generate_openrc_content() {
+    _env_exports="$(emit_openrc_environment_exports)"
     cat <<EOF
 #!/sbin/openrc-run
 name="$SERVICE_NAME"
@@ -763,6 +837,7 @@ command_user="telemt:telemt"
 pidfile="/run/\${RC_SVCNAME}.pid"
 directory="${WORK_DIR}"
 rc_ulimit="-n 65536"
+$_env_exports
 depend() { need net; use logger; }
 EOF
 }
@@ -988,6 +1063,17 @@ case "$ACTION" in
         install_config
 
         say "$L_I_STAGE_7"
+        # If any runtime-tuning knob was set in the environment, mention it
+        # once so the operator can verify it ended up in the service unit.
+        for _v in TELEMT_WORKER_THREADS TELEMT_MAX_BLOCKING_THREADS \
+                  TELEMT_ACCEPT_SHARDS TELEMT_KERNEL_REUSEPORT_SHARDS \
+                  TELEMT_KERNEL_REUSEPORT_SHARDS_AUTO TELEMT_IPTRACKER_SHARDS \
+                  TELEMT_MIDDLE_RELAY_MERGED_TASKS; do
+            _val="$(eval "printf '%s' \"\${$_v}\"")"
+            if [ -n "$_val" ]; then
+                say "  -> ${_v}=${_val}"
+            fi
+        done
         install_service
 
         if [ "${SERVICE_START_FAILED:-0}" -eq 1 ]; then
