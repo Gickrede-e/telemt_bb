@@ -2803,9 +2803,19 @@ async fn write_all_client_or_cancel<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // `biased;` makes cancel-checking deterministically win over write_all
+    // when both arms are ready. Without it, tokio::select!'s default fair
+    // polling lets a write that completed entirely inside `CryptoWriter`'s
+    // 8 KiB output buffer (i.e. small payloads that never touched the inner
+    // writer) race against an already-cancelled token — a coin flip that
+    // flakes `me_writer_data_write_obeys_flow_cancellation` ~50 % of the
+    // time. The semantic intent here is "cancel beats write", matching the
+    // test's name and the production invariant that a cancelled session
+    // must not advance bytes_me2c / user octets.
     tokio::select! {
-        result = client_writer.write_all(bytes) => result.map_err(ProxyError::Io),
+        biased;
         _ = cancel.cancelled() => Err(ProxyError::MiddleClientWriterCancelled),
+        result = client_writer.write_all(bytes) => result.map_err(ProxyError::Io),
     }
 }
 
@@ -2816,9 +2826,12 @@ async fn flush_client_or_cancel<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // Mirror the biased-cancel rule from `write_all_client_or_cancel` so the
+    // invariant is consistent across both helpers.
     tokio::select! {
-        result = client_writer.flush() => result.map_err(ProxyError::Io),
+        biased;
         _ = cancel.cancelled() => Err(ProxyError::MiddleClientWriterCancelled),
+        result = client_writer.flush() => result.map_err(ProxyError::Io),
     }
 }
 
