@@ -1830,6 +1830,62 @@ pub struct AntiCensorshipConfig {
     /// Upper bound (ms) for masking outcome timing envelope.
     #[serde(default = "default_mask_timing_normalization_ceiling_ms")]
     pub mask_timing_normalization_ceiling_ms: u64,
+
+    /// When true, emit a debug trace whenever a ClientHello carries the
+    /// `encrypted_client_hello` extension (codepoint `0xfe0d`, ECH).
+    /// Disabled by default to avoid log spam; useful for telemetry only.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.3.
+    #[serde(default)]
+    pub ech_log_observed: bool,
+
+    /// Pool of TLS 1.3 cipher suites the FakeTLS ServerHello may select
+    /// from when no upstream profile is captured. Choice is deterministic
+    /// by the hash of the ClientHello digest so a given client always sees
+    /// the same suite. Default covers AES-128, AES-256, CHACHA20-POLY1305.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
+    #[serde(default = "default_cipher_suites_pool")]
+    pub cipher_suites_pool: Vec<u16>,
+
+    /// When true (default), permute ServerHello extension order
+    /// deterministically by the ClientHello digest. When false, keep
+    /// the legacy fixed order (key_share, supported_versions).
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
+    #[serde(default = "default_extension_order_randomize")]
+    pub extension_order_randomize: bool,
+
+    /// Profile pool for the ALPN value echoed in ServerHello. Each
+    /// profile is a preference-ordered list of acceptable protocols.
+    /// Selection is keyed by `hash(sni || time_bucket)`; selected entry
+    /// is the first profile-protocol that also appears in the client
+    /// ALPN list (RFC 7301 §3.2 intersection). Defaults preserve current
+    /// behavior on real Chromium/Firefox clients.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.6.
+    #[serde(default = "default_alpn_profiles")]
+    pub alpn_profiles: Vec<Vec<String>>,
+
+    /// Time-bucket size (seconds) for the SNI-keyed ALPN profile pick.
+    /// Setting 86400 makes a given SNI see a stable profile per day.
+    /// 0 disables the bucket and locks the profile choice per SNI.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.6.
+    #[serde(default = "default_alpn_profile_bucket_secs")]
+    pub alpn_profile_bucket_secs: u64,
+
+    /// Additional candidate mask hosts. When non-empty, supersedes
+    /// `mask_host` for selection. Selection rule:
+    ///   1. If client SNI matches an entry in `mask_host_by_sni` map → use mapped host.
+    ///   2. Else `hash(client_ip) % mask_hosts.len() → mask_hosts[i]`.
+    ///
+    /// Legacy `mask_host` is still honored as final fallback.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.8.
+    #[serde(default)]
+    pub mask_hosts: Vec<String>,
+
+    /// Optional explicit map from inbound SNI to mask host. Lookup is
+    /// case-insensitive. When a hit is found here, the entry overrides
+    /// the `hash(client_ip)` distribution from `mask_hosts`.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.8.
+    #[serde(default)]
+    pub mask_host_by_sni: HashMap<String, String>,
 }
 
 impl Default for AntiCensorshipConfig {
@@ -1867,6 +1923,13 @@ impl Default for AntiCensorshipConfig {
             mask_timing_normalization_enabled: default_mask_timing_normalization_enabled(),
             mask_timing_normalization_floor_ms: default_mask_timing_normalization_floor_ms(),
             mask_timing_normalization_ceiling_ms: default_mask_timing_normalization_ceiling_ms(),
+            ech_log_observed: false,
+            cipher_suites_pool: default_cipher_suites_pool(),
+            extension_order_randomize: default_extension_order_randomize(),
+            alpn_profiles: default_alpn_profiles(),
+            alpn_profile_bucket_secs: default_alpn_profile_bucket_secs(),
+            mask_hosts: Vec::new(),
+            mask_host_by_sni: HashMap::new(),
         }
     }
 }

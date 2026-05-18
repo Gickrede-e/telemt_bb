@@ -963,6 +963,49 @@ fn find_matching_tls_domain<'a>(config: &'a ProxyConfig, sni: &str) -> Option<&'
     None
 }
 
+/// Select an ALPN protocol to echo in ServerHello from a configured profile
+/// pool, keyed by `hash(sni || time_bucket)`. Returns the first profile entry
+/// that ALSO appears in the client's offered ALPN list (RFC 7301 §3.2). Returns
+/// `None` when the intersection is empty so the caller can fall back to the
+/// legacy `h2 > http/1.1` rule.
+///
+/// Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §2.6.
+fn select_alpn_echo(
+    client_alpn: &[Vec<u8>],
+    sni: Option<&str>,
+    profiles: &[Vec<String>],
+    bucket_secs: u64,
+) -> Option<Vec<u8>> {
+    if profiles.is_empty() || client_alpn.is_empty() {
+        return None;
+    }
+    let bucket = if bucket_secs == 0 {
+        0u64
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / bucket_secs)
+            .unwrap_or(0)
+    };
+    // FNV-1a mix over (sni || bucket).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in sni.unwrap_or("").as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for b in bucket.to_le_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let profile = &profiles[(h as usize) % profiles.len()];
+    for pref in profile {
+        if client_alpn.iter().any(|p| p.as_slice() == pref.as_bytes()) {
+            return Some(pref.as_bytes().to_vec());
+        }
+    }
+    None
+}
+
 async fn maybe_apply_server_hello_delay(config: &ProxyConfig) {
     if config.censorship.server_hello_delay_max_ms == 0 {
         return;
@@ -1113,22 +1156,48 @@ where
         .as_deref()
         .and_then(|sni| find_matching_tls_domain(config, sni));
 
+    if config.censorship.ech_log_observed
+        && let Some(obs) = tls::observe_ech_in_client_hello(handshake)
+    {
+        debug!(
+            peer = %peer,
+            sni = %client_sni.as_deref().unwrap_or(""),
+            ech = ?obs,
+            "ECH-bearing ClientHello observed"
+        );
+    }
+
     let alpn_list = if config.censorship.alpn_enforce {
         tls::extract_alpn_from_client_hello(handshake)
     } else {
         Vec::new()
     };
     let selected_alpn = if config.censorship.alpn_enforce {
-        if alpn_list.iter().any(|p| p == b"h2") {
-            Some(b"h2".to_vec())
-        } else if alpn_list.iter().any(|p| p == b"http/1.1") {
-            Some(b"http/1.1".to_vec())
-        } else if !alpn_list.is_empty() {
-            maybe_apply_server_hello_delay(config).await;
-            debug!(peer = %peer, "Client ALPN list has no supported protocol; using masking fallback");
-            return HandshakeResult::BadClient { reader, writer };
-        } else {
-            None
+        // 2.6: prefer profile-driven selection. Same client SNI maps to the
+        // same profile within the configured time bucket, but distinct SNIs
+        // can land on different profiles — breaking the single-fingerprint
+        // pattern of the legacy `h2 > http/1.1` echo.
+        let from_profile = select_alpn_echo(
+            &alpn_list,
+            client_sni.as_deref(),
+            &config.censorship.alpn_profiles,
+            config.censorship.alpn_profile_bucket_secs,
+        );
+        match from_profile {
+            Some(echo) => Some(echo),
+            None => {
+                if alpn_list.iter().any(|p| p == b"h2") {
+                    Some(b"h2".to_vec())
+                } else if alpn_list.iter().any(|p| p == b"http/1.1") {
+                    Some(b"http/1.1".to_vec())
+                } else if !alpn_list.is_empty() {
+                    maybe_apply_server_hello_delay(config).await;
+                    debug!(peer = %peer, "Client ALPN list has no supported protocol; using masking fallback");
+                    return HandshakeResult::BadClient { reader, writer };
+                } else {
+                    None
+                }
+            }
         }
     } else {
         None
@@ -1515,6 +1584,8 @@ where
             rng,
             selected_alpn.clone(),
             config.censorship.tls_new_session_tickets,
+            &config.censorship.cipher_suites_pool,
+            config.censorship.extension_order_randomize,
         )
     } else {
         tls::build_server_hello(
@@ -1525,6 +1596,9 @@ where
             rng,
             selected_alpn.clone(),
             config.censorship.tls_new_session_tickets,
+            &config.censorship.cipher_suites_pool,
+            config.censorship.extension_order_randomize,
+            &validation_digest,
         )
     };
 
@@ -2088,6 +2162,10 @@ mod saturation_poison_security_tests;
 #[cfg(test)]
 #[path = "tests/handshake_auth_probe_hardening_adversarial_tests.rs"]
 mod auth_probe_hardening_adversarial_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_alpn_profile_tests.rs"]
+mod alpn_profile_tests;
 
 #[cfg(test)]
 #[path = "tests/handshake_auth_probe_scan_budget_security_tests.rs"]

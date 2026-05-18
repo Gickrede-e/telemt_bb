@@ -1340,6 +1340,9 @@ fn build_server_hello_never_places_alpn_in_server_hello_extensions() {
         &rng,
         Some(b"h2".to_vec()),
         0,
+        &[],
+        false,
+        &client_digest,
     );
     let exts = server_hello_extension_types(&response);
     assert!(
@@ -1388,6 +1391,8 @@ fn emulated_server_hello_never_places_alpn_in_server_hello_extensions() {
         &rng,
         Some(b"h2".to_vec()),
         0,
+        &[],
+        false,
     );
     let exts = server_hello_extension_types(&response);
     assert!(
@@ -1435,7 +1440,18 @@ fn test_build_server_hello_structure() {
     let session_id = vec![0xAA; 32];
 
     let rng = crate::crypto::SecureRandom::new();
-    let response = build_server_hello(secret, &client_digest, &session_id, 2048, &rng, None, 0);
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        2048,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
 
     assert!(response.len() > 100);
     assert_eq!(response[0], TLS_RECORD_HANDSHAKE);
@@ -1460,8 +1476,30 @@ fn test_build_server_hello_digest() {
     let session_id = vec![0xAA; 32];
 
     let rng = crate::crypto::SecureRandom::new();
-    let response1 = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 0);
-    let response2 = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 0);
+    let response1 = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1024,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
+    let response2 = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1024,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
 
     let digest1 = &response1[TLS_DIGEST_POS..TLS_DIGEST_POS + TLS_DIGEST_LEN];
     assert!(!digest1.iter().all(|&b| b == 0));
@@ -1792,7 +1830,18 @@ fn server_hello_digest_verifies_against_full_response() {
     let session_id = vec![0xAA; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let response = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 1);
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1024,
+        &rng,
+        None,
+        1,
+        &[],
+        false,
+        &client_digest,
+    );
     let mut zeroed = response.clone();
     zeroed[TLS_DIGEST_POS..TLS_DIGEST_POS + TLS_DIGEST_LEN].fill(0);
 
@@ -1815,7 +1864,18 @@ fn server_hello_digest_fails_after_single_byte_tamper() {
     let session_id = vec![0xBB; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let mut response = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 0);
+    let mut response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1024,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
     response[TLS_DIGEST_POS + TLS_DIGEST_LEN + 1] ^= 0x01;
 
     let mut zeroed = response.clone();
@@ -1844,7 +1904,18 @@ fn server_hello_application_data_payload_varies_across_runs() {
 
     let mut unique_payloads: HashSet<Vec<u8>> = HashSet::new();
     for _ in 0..16 {
-        let response = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, 0);
+        let response = build_server_hello(
+            secret,
+            &client_digest,
+            &session_id,
+            1024,
+            &rng,
+            None,
+            0,
+            &[],
+            false,
+            &client_digest,
+        );
 
         let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
         let ccs_pos = 5 + sh_len;
@@ -1921,7 +1992,18 @@ fn server_hello_clamps_fake_cert_len_lower_bound() {
     let session_id = vec![0x77; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let response = build_server_hello(secret, &client_digest, &session_id, 1, &rng, None, 0);
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
     let ccs_pos = 5 + sh_len;
@@ -1943,7 +2025,18 @@ fn server_hello_clamps_fake_cert_len_upper_bound() {
     let session_id = vec![0x66; 32];
     let rng = crate::crypto::SecureRandom::new();
 
-    let response = build_server_hello(secret, &client_digest, &session_id, 65_535, &rng, None, 0);
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        65_535,
+        &rng,
+        None,
+        0,
+        &[],
+        false,
+        &client_digest,
+    );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
     let ccs_pos = 5 + sh_len;
@@ -1974,6 +2067,9 @@ fn server_hello_new_session_ticket_count_matches_configuration() {
         &rng,
         None,
         tickets,
+        &[],
+        false,
+        &client_digest,
     );
 
     let mut pos = 0usize;
@@ -2014,6 +2110,9 @@ fn server_hello_new_session_ticket_count_is_safely_capped() {
         &rng,
         None,
         u8::MAX,
+        &[],
+        false,
+        &client_digest,
     );
 
     let mut pos = 0usize;
@@ -2193,6 +2292,9 @@ fn server_hello_application_data_contains_alpn_marker_when_selected() {
         &rng,
         Some(b"h2".to_vec()),
         0,
+        &[],
+        false,
+        &client_digest,
     );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
@@ -2227,6 +2329,9 @@ fn server_hello_ignores_oversized_alpn_and_still_caps_ticket_tail() {
         &rng,
         Some(oversized_alpn),
         u8::MAX,
+        &[],
+        false,
+        &client_digest,
     );
 
     let mut pos = 0usize;
@@ -2281,6 +2386,9 @@ fn server_hello_ignores_oversized_alpn_when_marker_would_not_fit() {
         &rng,
         Some(oversized_alpn),
         0,
+        &[],
+        false,
+        &client_digest,
     );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
@@ -2319,6 +2427,9 @@ fn server_hello_embeds_full_alpn_marker_when_it_exactly_fits_fake_cert_len() {
         &rng,
         Some(proto.clone()),
         0,
+        &[],
+        false,
+        &client_digest,
     );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
@@ -2356,6 +2467,9 @@ fn server_hello_does_not_embed_partial_alpn_marker_when_one_byte_short() {
         &rng,
         Some(proto),
         0,
+        &[],
+        false,
+        &client_digest,
     );
 
     let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
@@ -2427,6 +2541,299 @@ fn light_fuzz_tls_header_classifier_and_parser_policy_consistency() {
             "parser policy mismatch for header {header:02x?}"
         );
     }
+}
+
+// ============= 2.2 — cipher pool + extension order shuffle =============
+// Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §2.2.
+
+#[test]
+fn cipher_pool_selection_is_deterministic_for_same_digest() {
+    let digest = [0x42u8; 32];
+    let pool = [0x1301u16, 0x1302, 0x1303];
+    let pick_a = select_cipher_from_pool(&pool, &digest);
+    for _ in 0..1000 {
+        let pick_b = select_cipher_from_pool(&pool, &digest);
+        assert_eq!(pick_a, pick_b);
+    }
+}
+
+#[test]
+fn cipher_pool_selection_distributes_across_pool() {
+    let pool = [0x1301u16, 0x1302, 0x1303];
+    let mut counts = [0u32; 3];
+    for seed in 0u32..256 {
+        let mut digest = [0u8; 32];
+        digest[0] = (seed & 0xff) as u8;
+        digest[1] = ((seed >> 8) & 0xff) as u8;
+        let pick = select_cipher_from_pool(&pool, &digest);
+        let suite = u16::from_be_bytes(pick);
+        let idx = pool.iter().position(|&s| s == suite).unwrap();
+        counts[idx] += 1;
+    }
+    // Expect roughly uniform — each suite gets ≥ 20% of 256 picks (≥ 51).
+    for (i, &c) in counts.iter().enumerate() {
+        assert!(
+            c >= 51,
+            "suite {} picked only {} times out of 256 (<20%)",
+            i,
+            c
+        );
+    }
+}
+
+#[test]
+fn cipher_pool_selection_falls_back_when_pool_empty() {
+    let digest = [0xabu8; 32];
+    let pick = select_cipher_from_pool(&[], &digest);
+    let suite = u16::from_be_bytes(pick);
+    assert!(matches!(suite, 0x1301 | 0x1302 | 0x1303));
+}
+
+#[test]
+fn extension_shuffle_is_deterministic_for_same_seed() {
+    let blob = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x0033u16.to_be_bytes());
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        v.extend_from_slice(&0x002bu16.to_be_bytes());
+        v.extend_from_slice(&2u16.to_be_bytes());
+        v.extend_from_slice(&[0xee, 0xff]);
+        v
+    };
+    let seed = [0x77u8; 32];
+    let out_a = shuffle_extension_blocks(&blob, &seed);
+    for _ in 0..50 {
+        let out_b = shuffle_extension_blocks(&blob, &seed);
+        assert_eq!(out_a, out_b);
+    }
+}
+
+#[test]
+fn extension_shuffle_reorders_blocks_for_different_seeds() {
+    let blob = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x0033u16.to_be_bytes());
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        v.extend_from_slice(&0x002bu16.to_be_bytes());
+        v.extend_from_slice(&2u16.to_be_bytes());
+        v.extend_from_slice(&[0xee, 0xff]);
+        v
+    };
+    let mut saw_key_share_first = 0;
+    let mut saw_supported_versions_first = 0;
+    for s in 0u8..=255 {
+        let seed = [s; 32];
+        let out = shuffle_extension_blocks(&blob, &seed);
+        let head = u16::from_be_bytes([out[0], out[1]]);
+        match head {
+            0x0033 => saw_key_share_first += 1,
+            0x002b => saw_supported_versions_first += 1,
+            other => panic!("unexpected ext type {:#x}", other),
+        }
+    }
+    assert!(saw_key_share_first > 30 && saw_supported_versions_first > 30);
+}
+
+#[test]
+fn extension_shuffle_preserves_byte_count() {
+    let blob = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x0033u16.to_be_bytes());
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        v.extend_from_slice(&0x002bu16.to_be_bytes());
+        v.extend_from_slice(&2u16.to_be_bytes());
+        v.extend_from_slice(&[0xee, 0xff]);
+        v
+    };
+    let seed = [0x99u8; 32];
+    let out = shuffle_extension_blocks(&blob, &seed);
+    assert_eq!(out.len(), blob.len());
+}
+
+#[test]
+fn extension_shuffle_noop_when_single_block() {
+    let blob = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x0033u16.to_be_bytes());
+        v.extend_from_slice(&2u16.to_be_bytes());
+        v.extend_from_slice(&[0xab, 0xcd]);
+        v
+    };
+    let out = shuffle_extension_blocks(&blob, &[0u8; 32]);
+    assert_eq!(out, blob);
+}
+
+#[test]
+fn server_hello_legacy_order_when_randomize_disabled() {
+    let session_id = vec![0x01; 32];
+    let key = [0x55u8; 32];
+    let builder = ServerHelloBuilder::new(session_id)
+        .with_x25519_key(&key)
+        .with_tls13_version();
+    let record = builder.build_record();
+    let session_id_pos = 5 + 4 + 2 + 32;
+    let session_id_len = record[session_id_pos] as usize;
+    let ext_len_pos = session_id_pos + 1 + session_id_len + 2 + 1;
+    let ext_start = ext_len_pos + 2;
+    let first_etype = u16::from_be_bytes([record[ext_start], record[ext_start + 1]]);
+    assert_eq!(first_etype, 0x0033);
+}
+
+#[test]
+fn server_hello_cipher_override_takes_effect() {
+    let session_id = vec![0x01; 32];
+    let key = [0x55u8; 32];
+    let builder = ServerHelloBuilder::new(session_id)
+        .with_x25519_key(&key)
+        .with_tls13_version()
+        .with_cipher_suite([0x13, 0x03]);
+    let record = builder.build_record();
+    // Cipher position: record header (5) + msg type+len (4) + version (2)
+    // + random (32) + session_id_len (1) + session_id (32) = 76.
+    let cipher = [record[76], record[77]];
+    assert_eq!(cipher, [0x13, 0x03]);
+}
+
+// ============= ECH (Encrypted ClientHello, 0xfe0d) observation tests =============
+// Refs docs/PERFORMANCE_AND_ANTIDETECT.ru.md §2.3.
+
+#[test]
+fn ech_observation_returns_none_when_extension_absent() {
+    let ch = build_client_hello_with_exts(vec![], "ech.test");
+    assert_eq!(observe_ech_in_client_hello(&ch), None);
+}
+
+#[test]
+fn ech_observation_classifies_inner_indicator() {
+    // Inner: exactly 1 byte = 0x01.
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x01])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
+}
+
+#[test]
+fn ech_observation_classifies_outer_payload() {
+    // Outer: 0x00 + 4-byte cipher_suite + 1-byte config_id + 2-byte enc-len
+    // + enc bytes + 2-byte payload-len + payload bytes. Mimic a 200-byte
+    // HPKE payload — well above the 11-byte minimum.
+    let mut data = Vec::new();
+    data.push(0x00); // outer variant
+    data.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // kdf+aead
+    data.push(0x00); // config_id
+    data.extend_from_slice(&32u16.to_be_bytes()); // enc len
+    data.extend_from_slice(&[0xab; 32]); // enc bytes
+    data.extend_from_slice(&160u16.to_be_bytes()); // payload len
+    data.extend_from_slice(&[0xcd; 160]); // payload bytes
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, data)], "ech.outer.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Outer)
+    );
+}
+
+#[test]
+fn ech_observation_reports_malformed_on_truncated_outer() {
+    // Outer indicator with elen < 11 -> Malformed (not panic).
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x00, 0xaa, 0xbb])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_reports_malformed_on_wrong_type_byte() {
+    // Type byte 0x02 (neither 0x00 outer nor 0x01 inner).
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x02])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_reports_malformed_on_zero_length_payload() {
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_reports_malformed_when_inner_len_not_one() {
+    // Inner must be exactly 1 byte 0x01.
+    let ch = build_client_hello_with_exts(vec![(0xfe0d, vec![0x01, 0xff])], "ech.test");
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Malformed)
+    );
+}
+
+#[test]
+fn ech_observation_does_not_panic_on_oversized_length_field() {
+    // Craft a raw ext blob where the ECH extension claims elen > remaining bytes.
+    let mut ext_blob = Vec::new();
+    ext_blob.extend_from_slice(&0xfe0du16.to_be_bytes());
+    ext_blob.extend_from_slice(&0xffffu16.to_be_bytes()); // claimed elen
+    ext_blob.extend_from_slice(&[0x00, 0xaa, 0xbb]); // only 3 bytes actually present
+    let ch = build_client_hello_with_raw_extensions(&ext_blob);
+    // Must not panic; bounds check yields either Malformed or None.
+    let observed = observe_ech_in_client_hello(&ch);
+    assert!(matches!(observed, None | Some(EchObservation::Malformed)));
+}
+
+#[test]
+fn ech_observation_finds_extension_after_other_extensions() {
+    // Place a benign extension first, then ECH.
+    let ch = build_client_hello_with_exts(
+        vec![(0x0a0a, Vec::new()), (0xfe0d, vec![0x01])],
+        "ech.after.grease",
+    );
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
+}
+
+#[test]
+fn ech_observation_returns_first_when_duplicated() {
+    // Strictly speaking duplicate 0xfe0d is illegal. Behavior: return the
+    // first parsed observation, no panic, no double counting.
+    let ch = build_client_hello_with_exts(
+        vec![(0xfe0d, vec![0x01]), (0xfe0d, vec![0x00])],
+        "ech.dup.test",
+    );
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
+}
+
+#[test]
+fn ech_observation_coexists_with_sni_and_alpn_parsers() {
+    // Build a CH with ALPN + ECH + SNI, assert each parser independently works.
+    let mut alpn_data = Vec::new();
+    alpn_data.extend_from_slice(&3u16.to_be_bytes());
+    alpn_data.push(2);
+    alpn_data.extend_from_slice(b"h2");
+    let ch = build_client_hello_with_exts(
+        vec![(0x0010, alpn_data), (0xfe0d, vec![0x01])],
+        "ech.mixed.test",
+    );
+    assert_eq!(
+        observe_ech_in_client_hello(&ch),
+        Some(EchObservation::Inner)
+    );
+    let sni = extract_sni_from_client_hello(&ch);
+    assert_eq!(sni.as_deref(), Some("ech.mixed.test"));
+    let alpn = extract_alpn_from_client_hello(&ch);
+    assert_eq!(alpn, vec![b"h2".to_vec()]);
 }
 
 #[test]

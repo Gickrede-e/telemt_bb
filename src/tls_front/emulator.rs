@@ -15,6 +15,41 @@ const MIN_APP_DATA: usize = 64;
 const MAX_APP_DATA: usize = MAX_TLS_CIPHERTEXT_SIZE;
 const MAX_TICKET_RECORDS: usize = 4;
 
+/// Pick a cipher from `pool` deterministically by `client_digest`. Thin
+/// wrapper to keep the emulator module focused; reuses the shared helper
+/// in `crate::protocol::tls`.
+fn select_cipher_from_pool(pool: &[u16], client_digest: &[u8]) -> [u8; 2] {
+    crate::protocol::tls::select_cipher_from_pool(pool, client_digest)
+}
+
+/// Permute reorderable TLS 1.3 ServerHello extensions deterministically by
+/// `client_digest`. Re-uses the shared shuffle helper in `crate::protocol::tls`
+/// by round-tripping through the flat blob representation; cost is one extra
+/// pair of `Vec` allocations per handshake, well below per-handshake budget.
+fn permute_extensions_by_digest(blocks: &mut Vec<Vec<u8>>, client_digest: &[u8]) {
+    if blocks.len() < 2 {
+        return;
+    }
+    let total: usize = blocks.iter().map(|b| b.len()).sum();
+    let mut blob = Vec::with_capacity(total);
+    for block in blocks.iter() {
+        blob.extend_from_slice(block);
+    }
+    let shuffled = crate::protocol::tls::shuffle_extension_blocks(&blob, client_digest);
+    // Re-split shuffled blob back into per-extension blocks for the caller.
+    blocks.clear();
+    let mut pos = 0usize;
+    while pos + 4 <= shuffled.len() {
+        let elen = u16::from_be_bytes([shuffled[pos + 2], shuffled[pos + 3]]) as usize;
+        let block_end = pos + 4 + elen;
+        if block_end > shuffled.len() {
+            break;
+        }
+        blocks.push(shuffled[pos..block_end].to_vec());
+        pos = block_end;
+    }
+}
+
 fn jitter_and_clamp_sizes(sizes: &[usize], rng: &SecureRandom) -> Vec<usize> {
     sizes
         .iter()
@@ -186,6 +221,13 @@ fn hash_compact_cert_info_payload(cert_payload: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// Build a ServerHello + CCS + ApplicationData sequence using cached TLS metadata.
+///
+/// `cipher_suites_pool` is the configured fallback pool of TLS 1.3 cipher
+/// suites used when no upstream profile was captured. `extension_order_randomize`
+/// controls whether the order of reorderable ServerHello extensions is permuted
+/// deterministically by `client_digest` (RFC 8446 §4.2 permits any ordering).
+///
+/// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
 pub fn build_emulated_server_hello(
     secret: &[u8],
     client_digest: &[u8; TLS_DIGEST_LEN],
@@ -197,18 +239,39 @@ pub fn build_emulated_server_hello(
     rng: &SecureRandom,
     alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
+    cipher_suites_pool: &[u16],
+    extension_order_randomize: bool,
 ) -> Vec<u8> {
     // --- ServerHello ---
-    let mut extensions = Vec::new();
+    // Build each extension block in isolation so the order can be permuted
+    // before serialization. Both extensions emitted here are reorderable per
+    // RFC 8446 §4.2. Future extensions like pre_shared_key (0x0029) MUST be
+    // appended after the shuffle (§4.2.11).
+    let mut extension_blocks: Vec<Vec<u8>> = Vec::with_capacity(2);
+
     let key = gen_fake_x25519_key(rng);
-    extensions.extend_from_slice(&0x0033u16.to_be_bytes());
-    extensions.extend_from_slice(&(2 + 2 + 32u16).to_be_bytes());
-    extensions.extend_from_slice(&0x001du16.to_be_bytes());
-    extensions.extend_from_slice(&(32u16).to_be_bytes());
-    extensions.extend_from_slice(&key);
-    extensions.extend_from_slice(&0x002bu16.to_be_bytes());
-    extensions.extend_from_slice(&(2u16).to_be_bytes());
-    extensions.extend_from_slice(&0x0304u16.to_be_bytes());
+    let mut key_share_block = Vec::with_capacity(4 + 2 + 2 + 32);
+    key_share_block.extend_from_slice(&0x0033u16.to_be_bytes());
+    key_share_block.extend_from_slice(&(2 + 2 + 32u16).to_be_bytes());
+    key_share_block.extend_from_slice(&0x001du16.to_be_bytes());
+    key_share_block.extend_from_slice(&(32u16).to_be_bytes());
+    key_share_block.extend_from_slice(&key);
+    extension_blocks.push(key_share_block);
+
+    let mut supported_versions_block = Vec::with_capacity(4 + 2);
+    supported_versions_block.extend_from_slice(&0x002bu16.to_be_bytes());
+    supported_versions_block.extend_from_slice(&(2u16).to_be_bytes());
+    supported_versions_block.extend_from_slice(&0x0304u16.to_be_bytes());
+    extension_blocks.push(supported_versions_block);
+
+    if extension_order_randomize {
+        permute_extensions_by_digest(&mut extension_blocks, client_digest);
+    }
+
+    let mut extensions = Vec::with_capacity(extension_blocks.iter().map(|b| b.len()).sum());
+    for block in &extension_blocks {
+        extensions.extend_from_slice(block);
+    }
     let extensions_len = extensions.len() as u16;
 
     let body_len = 2 + // version
@@ -227,15 +290,10 @@ pub fn build_emulated_server_hello(
     message.push(session_id.len() as u8);
     message.extend_from_slice(session_id);
     let cipher = if cached.server_hello_template.cipher_suite == [0, 0] {
-        // Fallback when no upstream profile was captured: pick between the two
-        // common TLS 1.3 cipher suites to avoid a single hard-coded signature.
-        // The choice is derived from the ClientHello digest so it stays stable
-        // within a single handshake but varies across clients.
-        if client_digest[0] & 1 == 0 {
-            [0x13, 0x01] // TLS_AES_128_GCM_SHA256
-        } else {
-            [0x13, 0x02] // TLS_AES_256_GCM_SHA384
-        }
+        // Fallback when no upstream profile was captured: derive the cipher
+        // suite from the ClientHello digest hashed against the configured
+        // pool. Same client digest -> same cipher (handshake retransmit safe).
+        select_cipher_from_pool(cipher_suites_pool, client_digest)
     } else {
         cached.server_hello_template.cipher_suite
     };
@@ -479,6 +537,8 @@ mod tests {
             &rng,
             None,
             0,
+            &[],
+            false,
         );
 
         assert_eq!(response[0], TLS_RECORD_HANDSHAKE);
@@ -507,6 +567,8 @@ mod tests {
             &rng,
             None,
             0,
+            &[],
+            false,
         );
 
         let payload = first_app_data_payload(&response);
@@ -541,6 +603,8 @@ mod tests {
             &rng,
             None,
             0,
+            &[],
+            false,
         );
 
         let payload = first_app_data_payload(&response);
@@ -581,6 +645,8 @@ mod tests {
             &rng,
             None,
             0,
+            &[],
+            false,
         );
 
         let payload = first_app_data_payload(&response);
@@ -613,6 +679,8 @@ mod tests {
             &rng,
             Some(b"h2".to_vec()),
             0,
+            &[],
+            false,
         );
 
         let payload = first_app_data_payload(&response);
@@ -644,6 +712,8 @@ mod tests {
             &rng,
             None,
             0,
+            &[],
+            false,
         );
 
         let hello_len = u16::from_be_bytes([response[3], response[4]]) as usize;

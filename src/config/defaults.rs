@@ -599,6 +599,36 @@ pub(crate) fn default_alpn_enforce() -> bool {
     true
 }
 
+/// Default TLS 1.3 cipher suite pool for emulated ServerHello fallback path.
+/// Includes AES-128-GCM, AES-256-GCM, and CHACHA20-POLY1305. All are
+/// mandatory-to-implement per RFC 8446 §B.4.
+/// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.2.
+pub(crate) fn default_cipher_suites_pool() -> Vec<u16> {
+    vec![0x1301, 0x1302, 0x1303]
+}
+
+/// Default true: randomize the order of TLS 1.3 ServerHello extensions
+/// deterministically by the ClientHello digest. Reorderable per RFC 8446 §4.2.
+pub(crate) fn default_extension_order_randomize() -> bool {
+    true
+}
+
+/// Default ALPN profile pool. Profile 0 mirrors current Chromium-style
+/// `[h2, http/1.1]` echo path; profile 1 forces HTTP/1.1 for a fraction of
+/// (SNI, time-bucket) tuples to break the single-fingerprint pattern.
+/// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §2.6.
+pub(crate) fn default_alpn_profiles() -> Vec<Vec<String>> {
+    vec![
+        vec!["h2".to_string(), "http/1.1".to_string()],
+        vec!["http/1.1".to_string()],
+    ]
+}
+
+/// Default 86_400 s (1 day) — a given SNI sees a stable ALPN profile per day.
+pub(crate) fn default_alpn_profile_bucket_secs() -> u64 {
+    86_400
+}
+
 pub(crate) fn default_mask_shape_hardening() -> bool {
     true
 }

@@ -66,6 +66,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Install rustls crypto provider early
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Initialise per-feature env-var-driven flags before runtime startup so
+    // every connection observes a stable view of the config. Currently only
+    // gates the reserved merged-tasks middle-relay path; see the static at
+    // `proxy::middle_relay::MIDDLE_RELAY_MERGED_TASKS` for the deferral note.
+    proxy::middle_relay::init_middle_relay_feature_flags();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = cli::parse_command(&args);
 

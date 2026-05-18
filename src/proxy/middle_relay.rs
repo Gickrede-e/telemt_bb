@@ -8,7 +8,7 @@ use std::hash::Hasher;
 use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -67,6 +67,47 @@ const QUOTA_RESERVE_BACKOFF_MIN_MS: u64 = 1;
 const QUOTA_RESERVE_BACKOFF_MAX_MS: u64 = 16;
 const QUOTA_RESERVE_MAX_BACKOFF_ROUNDS: usize = 16;
 const ME_CHILD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Future opt-in for the merged-tasks middle-relay path: when set true at
+/// process startup via `TELEMT_MIDDLE_RELAY_MERGED_TASKS=1`, the per-connection
+/// `me_writer` task is absorbed into the main relay `tokio::select!` loop,
+/// reducing the per-connection task count from 3 to 2.
+///
+/// The merged-tasks implementation is reserved for a follow-up session that
+/// includes the load tests required by
+/// `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §1bis.7. Until then, this flag is
+/// initialised but only logged: the runtime path continues to spawn the
+/// legacy three-task topology so default behaviour is byte-identical.
+///
+/// Operators wanting the merged-tasks behaviour must wait for the follow-up
+/// PR that lands the actual select-arm rewrite (plan commits J1+J2 in the
+/// design doc accompanying this branch).
+static MIDDLE_RELAY_MERGED_TASKS: AtomicBool = AtomicBool::new(false);
+
+/// Read `TELEMT_MIDDLE_RELAY_MERGED_TASKS` env var once and cache the result
+/// into `MIDDLE_RELAY_MERGED_TASKS`. Called from `main.rs` after env init.
+pub fn init_middle_relay_feature_flags() {
+    let enabled = std::env::var("TELEMT_MIDDLE_RELAY_MERGED_TASKS")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false);
+    MIDDLE_RELAY_MERGED_TASKS.store(enabled, Ordering::Relaxed);
+    if enabled {
+        // Loud one-line operator note: the env knob is recognised but the
+        // merged path is reserved for a follow-up. Document the deferral
+        // clearly so support requests aren't confused.
+        tracing::warn!(
+            "TELEMT_MIDDLE_RELAY_MERGED_TASKS=1 detected — merged-tasks middle-relay path is \
+             reserved for a follow-up release after load testing (see \
+             docs/PERFORMANCE_AND_ANTIDETECT.ru.md §J / §1bis.7); the runtime continues to \
+             use the legacy three-task topology"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn middle_relay_merged_tasks_enabled_for_tests() -> bool {
+    MIDDLE_RELAY_MERGED_TASKS.load(Ordering::Relaxed)
+}
 
 enum MiddleQuotaReserveError {
     LimitExceeded,
@@ -2824,3 +2865,77 @@ mod middle_relay_atomic_quota_invariant_tests;
 #[cfg(test)]
 #[path = "tests/middle_relay_baseline_invariant_tests.rs"]
 mod middle_relay_baseline_invariant_tests;
+
+#[cfg(test)]
+mod feature_flag_tests {
+    //! Tests for the J item env-flag plumbing. The actual merged-tasks
+    //! select-loop implementation is reserved for a follow-up after load
+    //! testing per docs/PERFORMANCE_AND_ANTIDETECT.ru.md §1bis.7; these
+    //! tests only verify the recognition + parsing of the env knob.
+
+    use super::*;
+
+    struct EnvGuard {
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("TELEMT_MIDDLE_RELAY_MERGED_TASKS").ok();
+            unsafe {
+                std::env::set_var("TELEMT_MIDDLE_RELAY_MERGED_TASKS", value);
+            }
+            Self { prev }
+        }
+        fn unset() -> Self {
+            let prev = std::env::var("TELEMT_MIDDLE_RELAY_MERGED_TASKS").ok();
+            unsafe {
+                std::env::remove_var("TELEMT_MIDDLE_RELAY_MERGED_TASKS");
+            }
+            Self { prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.as_deref() {
+                    Some(v) => std::env::set_var("TELEMT_MIDDLE_RELAY_MERGED_TASKS", v),
+                    None => std::env::remove_var("TELEMT_MIDDLE_RELAY_MERGED_TASKS"),
+                }
+            }
+        }
+    }
+
+    /// Single serial test exercising every recognised value to avoid env-var
+    /// races against any other test in this binary.
+    #[test]
+    fn middle_relay_merged_tasks_env_flag_recognition() {
+        // Default: unset → false.
+        {
+            let _g = EnvGuard::unset();
+            init_middle_relay_feature_flags();
+            assert!(!middle_relay_merged_tasks_enabled_for_tests());
+        }
+        for affirmative in ["1", "true", "TRUE", "yes", "on"] {
+            let _g = EnvGuard::set(affirmative);
+            init_middle_relay_feature_flags();
+            assert!(
+                middle_relay_merged_tasks_enabled_for_tests(),
+                "expected enabled for env value {:?}",
+                affirmative
+            );
+        }
+        for negative in ["0", "false", "no", "off", ""] {
+            let _g = EnvGuard::set(negative);
+            init_middle_relay_feature_flags();
+            assert!(
+                !middle_relay_merged_tasks_enabled_for_tests(),
+                "expected disabled for env value {:?}",
+                negative
+            );
+        }
+        // Restore the global static to its safe default for any tests that
+        // happen to run later in the same binary.
+        let _g = EnvGuard::unset();
+        init_middle_relay_feature_flags();
+    }
+}

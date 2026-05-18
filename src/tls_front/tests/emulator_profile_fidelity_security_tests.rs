@@ -68,6 +68,8 @@ fn emulated_server_hello_keeps_single_change_cipher_spec_for_client_compatibilit
         &rng,
         None,
         0,
+        &[],
+        false,
     );
 
     assert_eq!(response[0], TLS_RECORD_HANDSHAKE);
@@ -92,6 +94,8 @@ fn emulated_server_hello_does_not_emit_profile_ticket_tail_when_disabled() {
         &rng,
         None,
         0,
+        &[],
+        false,
     );
 
     let app_records = record_lengths_by_type(&response, TLS_RECORD_APPLICATION);
@@ -114,6 +118,8 @@ fn emulated_server_hello_uses_profile_ticket_lengths_when_enabled() {
         &rng,
         None,
         2,
+        &[],
+        false,
     );
 
     let app_records = record_lengths_by_type(&response, TLS_RECORD_APPLICATION);
