@@ -305,11 +305,19 @@ pub(crate) async fn spawn_runtime_tasks(
             all_reinit_txs.push(reinit_tx);
         }
 
-        // Rotation: one task drives rotation triggers for every shard.
-        // When the rotation timer fires it broadcasts to all shards so a
-        // rotation event is system-wide, not per-shard.
+        // Rotation: ONE task drives rotation for the system; a fan-out
+        // hop broadcasts each trigger to every shard's reinit channel so
+        // rotations fire simultaneously across shards.
+        //
+        // The previous design spawned one me_rotation_task per shard.
+        // Each had its own jitter/timer and drifted apart over hours —
+        // two parallel clients of the same operator would see writers
+        // rotate at different wall-clock instants, which is exactly the
+        // anti-detection regression sharding is meant to fix. Single
+        // source + clone-to-all preserves the system-wide invariant.
         let config_rx_clone_rot = config_rx.clone();
         if all_reinit_txs.len() == 1 {
+            // Single-shard fast path: no fan-out hop needed.
             let reinit_tx_rotation = all_reinit_txs.remove(0);
             tokio::spawn(async move {
                 crate::transport::middle_proxy::me_rotation_task(
@@ -319,21 +327,27 @@ pub(crate) async fn spawn_runtime_tasks(
                 .await;
             });
         } else {
-            // Multi-shard rotation fan-out: spawn one rotation task per
-            // shard, each driving its own reinit channel. This keeps
-            // rotation atomic per shard without changing the
-            // me_rotation_task signature.
-            for (shard_idx, reinit_tx_rotation) in all_reinit_txs.into_iter().enumerate() {
-                let config_rx_clone_rot_shard = config_rx_clone_rot.clone();
-                tokio::spawn(async move {
-                    tracing::debug!(shard_idx, "Starting me_rotation_task for shard");
-                    crate::transport::middle_proxy::me_rotation_task(
-                        config_rx_clone_rot_shard,
-                        reinit_tx_rotation,
-                    )
-                    .await;
-                });
-            }
+            let (rotation_source_tx, mut rotation_source_rx) =
+                mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
+            tokio::spawn(async move {
+                crate::transport::middle_proxy::me_rotation_task(
+                    config_rx_clone_rot,
+                    rotation_source_tx,
+                )
+                .await;
+            });
+            let shard_senders = all_reinit_txs;
+            tokio::spawn(async move {
+                while let Some(trigger) = rotation_source_rx.recv().await {
+                    for tx in &shard_senders {
+                        // try_send instead of send().await so a slow
+                        // shard can't backpressure rotation across
+                        // siblings. me_reinit_scheduler handles dedup if
+                        // the channel was already full with a Periodic.
+                        let _ = tx.try_send(trigger);
+                    }
+                }
+            });
         }
     }
 

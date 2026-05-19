@@ -212,112 +212,16 @@ pub(crate) async fn initialize_me_pool(
                 // init+supervisor via spawn_shard_supervisor.
                 let shard_overrides = compute_shard_overrides(config);
                 let shard_count = shard_overrides.len();
-                let pool = MePool::new(
-                    proxy_tag.clone(),
-                    proxy_secret.clone(),
-                    config.general.middle_proxy_nat_ip,
-                    me_nat_probe,
-                    None,
-                    config.network.stun_servers.clone(),
-                    config.general.stun_nat_probe_concurrency,
-                    probe.detected_ipv6,
-                    config.timeouts.me_one_retry,
-                    config.timeouts.me_one_timeout_ms,
-                    cfg_v4.map.clone(),
-                    cfg_v6.map.clone(),
-                    cfg_v4.default_dc.or(cfg_v6.default_dc),
-                    decision.clone(),
-                    Some(upstream_manager.clone()),
-                    rng.clone(),
-                    stats.clone(),
-                    config.general.me_keepalive_enabled,
-                    config.general.me_keepalive_interval_secs,
-                    config.general.me_keepalive_jitter_secs,
-                    config.general.me_keepalive_payload_random,
-                    config.general.rpc_proxy_req_every,
-                    config.general.me_warmup_stagger_enabled,
-                    config.general.me_warmup_step_delay_ms,
-                    config.general.me_warmup_step_jitter_ms,
-                    config.general.me_reconnect_max_concurrent_per_dc,
-                    config.general.me_reconnect_backoff_base_ms,
-                    config.general.me_reconnect_backoff_cap_ms,
-                    config.general.me_reconnect_fast_retry_count,
-                    config.general.me_single_endpoint_shadow_writers,
-                    config.general.me_single_endpoint_outage_mode_enabled,
-                    config.general.me_single_endpoint_outage_disable_quarantine,
-                    config.general.me_single_endpoint_outage_backoff_min_ms,
-                    config.general.me_single_endpoint_outage_backoff_max_ms,
-                    config.general.me_single_endpoint_shadow_rotate_every_secs,
-                    config.general.me_floor_mode,
-                    config.general.me_adaptive_floor_idle_secs,
-                    config.general.me_adaptive_floor_min_writers_single_endpoint,
-                    config.general.me_adaptive_floor_min_writers_multi_endpoint,
-                    config.general.me_writer_bind_multiplier,
-                    config.general.me_adaptive_floor_recover_grace_secs,
-                    config.general.me_adaptive_floor_writers_per_core_total,
-                    config.general.me_adaptive_floor_cpu_cores_override,
-                    config
-                        .general
-                        .me_adaptive_floor_max_extra_writers_single_per_core,
-                    config
-                        .general
-                        .me_adaptive_floor_max_extra_writers_multi_per_core,
-                    config.general.me_adaptive_floor_max_active_writers_per_core,
-                    config.general.me_adaptive_floor_max_warm_writers_per_core,
-                    config.general.me_adaptive_floor_max_active_writers_global,
-                    config.general.me_adaptive_floor_max_warm_writers_global,
-                    config.general.hardswap,
-                    config.general.me_pool_drain_ttl_secs,
-                    config.general.me_instadrain,
-                    config.general.me_pool_drain_threshold,
-                    config.general.me_pool_drain_soft_evict_enabled,
-                    config.general.me_pool_drain_soft_evict_grace_secs,
-                    config.general.me_pool_drain_soft_evict_per_writer,
-                    config.general.me_pool_drain_soft_evict_budget_per_core,
-                    config.general.me_pool_drain_soft_evict_cooldown_ms,
-                    config.general.effective_me_pool_force_close_secs(),
-                    config.general.me_pool_min_fresh_ratio,
-                    config.general.me_hardswap_warmup_delay_min_ms,
-                    config.general.me_hardswap_warmup_delay_max_ms,
-                    config.general.me_hardswap_warmup_extra_passes,
-                    config.general.me_hardswap_warmup_pass_backoff_base_ms,
-                    config.general.me_bind_stale_mode,
-                    config.general.me_bind_stale_ttl_secs,
-                    config.general.me_secret_atomic_snapshot,
-                    config.general.me_deterministic_writer_sort,
-                    config.general.me_writer_pick_mode,
-                    config.general.me_writer_pick_sample_size,
-                    config.general.me_socks_kdf_policy,
-                    config.general.me_writer_cmd_channel_capacity,
-                    config.general.me_route_channel_capacity,
-                    config.general.me_route_backpressure_enabled,
-                    config.general.me_route_fairshare_enabled,
-                    config.general.me_route_backpressure_base_timeout_ms,
-                    config.general.me_route_backpressure_high_timeout_ms,
-                    config.general.me_route_backpressure_high_watermark_pct,
-                    config.general.me_reader_route_data_wait_ms,
-                    config.general.me_health_interval_ms_unhealthy,
-                    config.general.me_health_interval_ms_healthy,
-                    config.general.me_warn_rate_limit_ms,
-                    config.general.me_route_no_writer_mode,
-                    config.general.me_route_no_writer_wait_ms,
-                    config.general.me_route_hybrid_max_wait_ms,
-                    config.general.me_route_blocking_send_timeout_ms,
-                    config.general.me_route_inline_recovery_attempts,
-                    config.general.me_route_inline_recovery_wait_ms,
-                    shard_overrides[0],
-                );
 
-                // Build supplementary shards (1..N) when sharding is active.
-                // Each MePool::new is cheap (just allocates state); their
-                // outbound MTProto handshakes happen later in the per-shard
-                // supervisor spawned below. Construction must complete before
-                // the mux is built so listeners see all N shards on their
-                // very first accept.
-                let mut shards: Vec<Arc<MePool>> = Vec::with_capacity(shard_count);
-                shards.push(pool.clone());
-                for &override_bind in shard_overrides.iter().skip(1) {
-                    shards.push(MePool::new(
+                // Closure that builds one MePool with the given source-IP
+                // override. Captures every constructor input by reference
+                // and clones inside the body, so the closure is callable N
+                // times to build N shards. Hides 85+ MePool::new arguments
+                // behind a one-arg interface — extending MePool::new now
+                // requires editing one site instead of two, eliminating
+                // the drift risk between primary and supplementary shards.
+                let make_pool = |override_bind: Option<IpAddr>| -> Arc<MePool> {
+                    MePool::new(
                         proxy_tag.clone(),
                         proxy_secret.clone(),
                         config.general.middle_proxy_nat_ip,
@@ -411,8 +315,16 @@ pub(crate) async fn initialize_me_pool(
                         config.general.me_route_inline_recovery_attempts,
                         config.general.me_route_inline_recovery_wait_ms,
                         override_bind,
-                    ));
-                }
+                    )
+                };
+
+                // Build all shards. Construction must complete before the
+                // mux is published so listeners see every shard on their
+                // very first accept; init (outbound MTProto handshake)
+                // happens asynchronously below.
+                let shards: Vec<Arc<MePool>> =
+                    shard_overrides.iter().copied().map(&make_pool).collect();
+                let pool = shards[0].clone();
 
                 startup_tracker
                     .complete_component(
@@ -445,7 +357,6 @@ pub(crate) async fn initialize_me_pool(
                         idx,
                         rng.clone(),
                         pool_size,
-                        me_init_retry_attempts,
                         me_ready_tx.clone(),
                     );
                 }
@@ -997,7 +908,6 @@ fn spawn_shard_supervisor(
     shard_idx: usize,
     rng: Arc<SecureRandom>,
     pool_size: usize,
-    me_init_retry_attempts: u32,
     me_ready_tx: watch::Sender<u64>,
 ) {
     std::thread::spawn(move || {
@@ -1026,6 +936,14 @@ fn spawn_shard_supervisor(
                             attempt = init_attempt,
                             "Additional MePool shard initialised successfully"
                         );
+                        // Per-shard readiness gate: flip the runtime-ready
+                        // flag only AFTER init() seeds writers, so the api
+                        // surface (`/v1/gates`, admission, stats) reports
+                        // truthful per-shard state instead of a global lie.
+                        // Connectivity.rs no longer flips this for
+                        // supplementary shards — the gate now flows from
+                        // each shard's own init lifecycle.
+                        pool.set_runtime_ready(true);
                         // Bump readiness watch so any /v1/* probe sees the
                         // additional shard as alive. Primary shard owns the
                         // initial readiness signal; this is supplementary.
@@ -1109,15 +1027,15 @@ fn spawn_shard_supervisor(
                         unreachable!();
                     }
                     Err(e) => {
-                        if me_init_retry_attempts > 0 && init_attempt >= me_init_retry_attempts {
-                            error!(
-                                shard_idx,
-                                error = %e,
-                                attempt = init_attempt,
-                                "shard MePool init retries exhausted; abandoning this shard"
-                            );
-                            break;
-                        }
+                        // Match the primary background path: retry
+                        // forever. Abandoning a shard would leave it in
+                        // the mux as a phantom — `shard_for_peer` still
+                        // routes ~1/N of clients to it but no writers
+                        // exist, returning no_writer for the lifetime of
+                        // the proxy. Retry-attempts is intentionally
+                        // *not* honoured here for that reason; operators
+                        // who want a fail-fast signal should use
+                        // me2dc_fallback + the primary path's hard fail.
                         warn!(
                             shard_idx,
                             error = %e,

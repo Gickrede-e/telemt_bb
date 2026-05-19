@@ -230,14 +230,11 @@ pub(crate) async fn run_startup_connectivity(
     info!("============================================================");
 
     if let Some(mux) = me_pool {
-        // Signal runtime-ready on every shard. A shard that hasn't yet
-        // completed background init will be skipped by listeners anyway
-        // (its writer pool is empty); flipping the flag costs nothing and
-        // lets the per-shard init path complete the ready transition once
-        // it lands.
-        for shard in mux.shards() {
-            shard.set_runtime_ready(true);
-        }
+        // Flip runtime-ready ONLY on the primary shard. Supplementary
+        // shards self-flip from their spawn_shard_supervisor as their
+        // own init() completes — this prevents the api gate from
+        // reporting a shard ready before its writer pool is seeded.
+        mux.primary().set_runtime_ready(true);
     }
     *api_me_pool.write().await = me_pool.clone();
 }
