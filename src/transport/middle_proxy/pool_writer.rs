@@ -358,6 +358,29 @@ impl MePool {
         }
 
         let dc_idx = i16::try_from(writer_dc).ok();
+        // Acquire a system-wide concurrent-connect permit (Phase 2 shard
+        // coordination). When the budget is set, every shard's connect
+        // queues through the same Semaphore — preventing the "all
+        // shards scale up simultaneously" burst that trips TG's per-
+        // source-IP rapid-flap quarantine. Permit auto-releases on
+        // drop (after handshake + writer registration completes).
+        // Single-pool deployments leave `connect_concurrency_budget`
+        // as None and pay no synchronization cost.
+        let _budget_permit = if let Some(budget) = &self.connect_concurrency_budget {
+            match budget.clone().acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    // Semaphore closed only during shutdown. Bail out
+                    // cleanly — the writer-spawn path is non-critical
+                    // (background floor scaling can retry).
+                    return Err(ProxyError::Proxy(
+                        "connect_concurrency_budget closed (shutdown?)".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let (stream, _connect_ms, upstream_egress) = self.connect_tcp(addr, dc_idx).await?;
         let hs = self
             .handshake_only(stream, addr, upstream_egress, rng)

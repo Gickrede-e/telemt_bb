@@ -1811,6 +1811,7 @@ mod tests {
             general.me_route_inline_recovery_attempts,
             general.me_route_inline_recovery_wait_ms,
             None,
+            None,
         )
     }
 

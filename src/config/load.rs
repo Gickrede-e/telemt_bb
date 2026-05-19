@@ -119,6 +119,7 @@ const GENERAL_CONFIG_KEYS: &[&str] = &[
     "me_adaptive_floor_min_writers_multi_endpoint",
     "me_writer_bind_multiplier",
     "me_writer_bind_mode",
+    "me_global_connect_concurrency",
     "me_adaptive_floor_recover_grace_secs",
     "me_adaptive_floor_writers_per_core_total",
     "me_adaptive_floor_cpu_cores_override",

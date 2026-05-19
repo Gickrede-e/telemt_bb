@@ -731,6 +731,30 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub me_writer_bind_mode: MeWriterBindMode,
 
+    /// Global cap on concurrent outbound TG connect attempts across ALL
+    /// shards. When the adaptive floor on multiple shards decides to
+    /// scale up simultaneously (e.g., load spike that all shards
+    /// observe at once), they each fire writer-spawn waves independently
+    /// — without coordination, N shards × M new-writers-per-shard
+    /// produces a burst that can trip Telegram's per-source-IP
+    /// connect-rate quarantine (`ME endpoint temporarily quarantined
+    /// due to rapid writer flap`).
+    ///
+    /// This cap is a system-wide semaphore: each shard's connect
+    /// acquires a permit before the TCP handshake, releases on
+    /// completion. Permits queue rather than fail, so the floor's
+    /// scale-up still completes — just smoothed across time instead
+    /// of bursting.
+    ///
+    /// `0` (default) disables — no cross-shard coordination, legacy
+    /// behaviour. Recommended for shard mode: 6×N where N = shard
+    /// count (e.g. 36 for 6 shards). Has no effect in round_robin
+    /// mode (single pool already serializes its own connects via the
+    /// per-DC refill_inflight set).
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B+.
+    #[serde(default)]
+    pub me_global_connect_concurrency: u32,
+
     /// Grace period in seconds to hold static floor after activity in adaptive mode.
     #[serde(default = "default_me_adaptive_floor_recover_grace_secs")]
     pub me_adaptive_floor_recover_grace_secs: u64,
@@ -1132,6 +1156,7 @@ impl Default for GeneralConfig {
                 default_me_adaptive_floor_min_writers_multi_endpoint(),
             me_writer_bind_multiplier: default_me_writer_bind_multiplier(),
             me_writer_bind_mode: MeWriterBindMode::default(),
+            me_global_connect_concurrency: 0,
             me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
             me_adaptive_floor_writers_per_core_total:
                 default_me_adaptive_floor_writers_per_core_total(),
