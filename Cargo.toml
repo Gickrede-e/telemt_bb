@@ -68,6 +68,15 @@ x25519-dalek = "2"
 anyhow = "1.0"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 
+# Global allocator: mimalloc replaces the system malloc. On this proxy
+# the hot path allocates a small buffer (~64-256 B) per packet across
+# hundreds of thousands of writers, which exposes ptmalloc's per-arena
+# contention. mimalloc's heap-per-thread design + free-list sharding
+# removes that bottleneck — typical wins are 10-20% throughput at high
+# connection counts. default-features = false drops the secure mode
+# (extra guard pages); we want raw speed for a network proxy.
+mimalloc = { version = "0.1", default-features = false }
+
 # HTTP
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 notify = "8.2"

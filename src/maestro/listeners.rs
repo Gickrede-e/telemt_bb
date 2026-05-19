@@ -21,7 +21,7 @@ use crate::stats::{ReplayChecker, Stats};
 use crate::stream::BufferPool;
 use crate::tls_front::TlsFrontCache;
 use crate::transport::middle_proxy::MePoolMux;
-use crate::transport::socket::set_linger_zero;
+use crate::transport::socket::{set_linger_zero, set_tcp_quickack};
 use crate::transport::{
     ListenOptions, UpstreamManager, create_sharded_listeners, find_listener_processes,
 };
@@ -556,9 +556,11 @@ pub(crate) fn spawn_tcp_accept_loops(
                                 use std::os::unix::io::AsRawFd;
                                 stream.as_raw_fd()
                             };
-                            if matches!(rst_mode, RstOnCloseMode::Errors | RstOnCloseMode::Always) {
-                                let _ = set_linger_zero(&stream);
-                            }
+                            // Cheap, common-case admission check FIRST. A
+                            // dropped connection should pay zero setsockopt
+                            // cost — under DDoS / overload this hot path
+                            // bottlenecks on the syscalls below if we apply
+                            // them indiscriminately.
                             if !*admission_rx_tcp.borrow() {
                                 debug!(peer = %peer_addr, "Admission gate closed, dropping connection");
                                 drop(stream);
@@ -598,6 +600,21 @@ pub(crate) fn spawn_tcp_accept_loops(
                                     }
                                 }
                             };
+                            // Connection is now committed (admission open +
+                            // permit acquired). Apply socket-level tuning
+                            // only at this point so dropped/rejected
+                            // connections don't pay for it.
+                            //
+                            //   * set_linger_zero — RST-on-close per
+                            //     operator config (eliminates FIN_WAIT_1
+                            //     accumulation under high churn)
+                            //   * set_tcp_quickack — kills Linux's delayed
+                            //     ACK on the FIRST reply (one-shot, see
+                            //     socket::set_tcp_quickack docstring)
+                            if matches!(rst_mode, RstOnCloseMode::Errors | RstOnCloseMode::Always) {
+                                let _ = set_linger_zero(&stream);
+                            }
+                            let _ = set_tcp_quickack(&stream);
                             let config = config_rx.borrow_and_update().clone();
                             // One refcount bump on the hot accept path; individual
                             // Arc clones happen inside the spawned task below.

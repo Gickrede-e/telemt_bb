@@ -34,6 +34,24 @@ mod tls_front;
 mod transport;
 mod util;
 
+// Replace the system allocator with mimalloc for the entire process.
+//
+// Why: telemt's hot path allocates a small buffer (~64-256 B) per relayed
+// packet across hundreds of thousands of writers. ptmalloc/dlmalloc serialize
+// on per-arena locks under that pressure, which shows up as wasted CPU at
+// high connection counts even though each individual alloc is tiny. mimalloc
+// uses heap-per-thread + free-list sharding, eliminating the contention.
+// Benchmark expectation: 10-20% throughput improvement at >50k concurrent
+// connections; minor (~1%) regression at low load due to slightly larger
+// per-thread state — net positive for production scale, neutral for dev.
+//
+// `default-features = false` drops mimalloc's secure mode (guard pages,
+// double-free detection). We're not trusting allocator-level hardening for
+// a network-facing service — defense in depth lives elsewhere (rustls,
+// MTProto crypto, scope-limited unsafe). Speed > paranoia here.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_name("telemt-worker");
