@@ -102,6 +102,7 @@ async fn make_pool() -> Arc<MePool> {
         general.me_route_blocking_send_timeout_ms,
         general.me_route_inline_recovery_attempts,
         general.me_route_inline_recovery_wait_ms,
+        None,
     )
 }
 

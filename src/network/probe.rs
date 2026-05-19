@@ -126,6 +126,7 @@ pub async fn run_probe(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), 443),
             None,
             true,
+            None,
         );
         let bind_v6 = UpstreamManager::resolve_bind_address(
             interface,
@@ -136,6 +137,7 @@ pub async fn run_probe(
             ),
             None,
             true,
+            None,
         );
 
         if let Some(IpAddr::V4(ip)) = bind_v4

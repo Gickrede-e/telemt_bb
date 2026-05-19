@@ -294,6 +294,11 @@ pub(crate) async fn initialize_me_pool(
                     config.general.me_route_blocking_send_timeout_ms,
                     config.general.me_route_inline_recovery_attempts,
                     config.general.me_route_inline_recovery_wait_ms,
+                    // shard_bind_override: legacy single-pool path leaves it unset
+                    // so UpstreamManager handles bind selection as before. The
+                    // mux path (`me_writer_bind_mode = "shard"`) constructs
+                    // each shard with its own pinned IP.
+                    None,
                 );
                 startup_tracker
                     .complete_component(
