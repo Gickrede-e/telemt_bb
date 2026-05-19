@@ -163,6 +163,40 @@ impl MeBindStaleMode {
     }
 }
 
+/// How telemt uses the multi-IP outbound pool from
+/// `[[upstreams]].bind_addresses`. See the docstring on
+/// `GeneralConfig::me_writer_bind_mode` for trade-offs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeWriterBindMode {
+    /// Single ME pool; bind addresses rotated by atomic counter on every
+    /// new writer creation. Honours `me_writer_bind_multiplier`. Default
+    /// for back-compat with deployments that predate per-IP sharding.
+    #[default]
+    RoundRobin,
+    /// N independent ME pools (one per bind address). Clients are hashed
+    /// to a shard by peer IP, and each shard's writers/quarantine/floor
+    /// are fully isolated from sibling shards. `me_writer_bind_multiplier`
+    /// is ignored — each shard's adaptive floor scales independently.
+    Shard,
+}
+
+impl MeWriterBindMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            MeWriterBindMode::RoundRobin => 0,
+            MeWriterBindMode::Shard => 1,
+        }
+    }
+
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => MeWriterBindMode::Shard,
+            _ => MeWriterBindMode::RoundRobin,
+        }
+    }
+}
+
 /// RST-on-close mode for accepted client sockets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -668,9 +702,34 @@ pub struct GeneralConfig {
     /// `resolve_bind_address`, this gives `M × required_writers` connections
     /// per DC where `M` = number of distinct source IPs. Operators with N
     /// public IPs typically set this to N. Defaults to 1 (no change). Max 32.
+    /// IGNORED when `me_writer_bind_mode = "shard"` — sharding gives
+    /// equivalent per-IP scaling with full state isolation, so combining
+    /// both would over-provision.
     /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B.
     #[serde(default = "default_me_writer_bind_multiplier")]
     pub me_writer_bind_multiplier: u32,
+
+    /// How telemt uses the multi-IP outbound pool from
+    /// `[[upstreams]].bind_addresses`. Two modes:
+    ///
+    /// * `round_robin` (default) — single ME pool; bind addresses are
+    ///   rotated via atomic counter on every new writer creation.
+    ///   `me_writer_bind_multiplier` is honoured (see above).
+    /// * `shard` — telemt creates N **independent** ME pools (one per bind
+    ///   address). Each shard has its own writers, registry, quarantine,
+    ///   and adaptive floor. Clients are hashed to a shard by peer IP
+    ///   (sticky-by-peer keeps KDF / fingerprint stable per session).
+    ///   The `me_writer_bind_multiplier` is then ignored — each shard's
+    ///   adaptive floor scales independently to its own load.
+    ///
+    /// Trade-off: `shard` gives per-IP failure containment (a degraded
+    /// source IP only quarantines its own shard's endpoints) and
+    /// granular stats, at the cost of more goroutines / memory for the
+    /// N parallel health-check / drain loops. Default keeps prior
+    /// behaviour for back-compat.
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B+.
+    #[serde(default)]
+    pub me_writer_bind_mode: MeWriterBindMode,
 
     /// Grace period in seconds to hold static floor after activity in adaptive mode.
     #[serde(default = "default_me_adaptive_floor_recover_grace_secs")]
@@ -1072,6 +1131,7 @@ impl Default for GeneralConfig {
             me_adaptive_floor_min_writers_multi_endpoint:
                 default_me_adaptive_floor_min_writers_multi_endpoint(),
             me_writer_bind_multiplier: default_me_writer_bind_multiplier(),
+            me_writer_bind_mode: MeWriterBindMode::default(),
             me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
             me_adaptive_floor_writers_per_core_total:
                 default_me_adaptive_floor_writers_per_core_total(),
