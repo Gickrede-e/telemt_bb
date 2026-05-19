@@ -24,6 +24,17 @@ pub(crate) struct MinimalCacheEntry {
     pub(super) generated_at_epoch_secs: u64,
 }
 
+/// Cache entry for the per-shard `/v1/stats/me-writers/by-shard`
+/// response. Sibling of `MinimalCacheEntry`; honoured under the same
+/// `minimal_runtime_cache_ttl_ms` operator knob. Without this, a
+/// Grafana scrape pair (aggregate + by-shard) would multiply per-
+/// shard RwLock pressure by N+1 — caching brings it back in line.
+#[derive(Clone)]
+pub(crate) struct ByShardCacheEntry {
+    pub(super) expires_at: Instant,
+    pub(super) payload: MeWritersByShardData,
+}
+
 pub(super) fn build_zero_all_data(stats: &Stats, configured_users: usize) -> ZeroAllData {
     let telemetry = stats.telemetry_policy();
     let bad_connection_classes = stats
@@ -626,6 +637,20 @@ pub(super) async fn build_me_writers_by_shard_data(
             shards: vec![],
         };
     }
+
+    // Cache: honours the same `minimal_runtime_cache_ttl_ms` knob as
+    // the aggregate endpoint. Without this, a Grafana scrape pair
+    // (aggregate + by-shard at the same interval) would multiply
+    // per-shard RwLock pressure by N+1 — every shard snapshotted once
+    // per endpoint per scrape. Cache TTL == 0 disables.
+    let cache_ttl_ms = api_cfg.minimal_runtime_cache_ttl_ms;
+    if cache_ttl_ms > 0
+        && let Some(entry) = shared.by_shard_cache.lock().await.clone()
+        && Instant::now() < entry.expires_at
+    {
+        return entry.payload;
+    }
+
     let Some(mux) = shared.me_pool.read().await.as_ref().cloned() else {
         return MeWritersByShardData {
             middle_proxy_enabled: false,
@@ -664,7 +689,6 @@ pub(super) async fn build_me_writers_by_shard_data(
                 .cloned()
                 .map(dc_status_from_snapshot)
                 .collect(),
-            writers_count: snap.writers.len(),
         })
         .collect();
 
@@ -674,12 +698,22 @@ pub(super) async fn build_me_writers_by_shard_data(
         .max()
         .unwrap_or(now);
 
-    MeWritersByShardData {
+    let payload = MeWritersByShardData {
         middle_proxy_enabled: true,
         reason: None,
         generated_at_epoch_secs,
         mode,
         shard_count: shards.len(),
         shards,
+    };
+
+    if cache_ttl_ms > 0 {
+        let entry = ByShardCacheEntry {
+            expires_at: Instant::now() + Duration::from_millis(cache_ttl_ms),
+            payload: payload.clone(),
+        };
+        *shared.by_shard_cache.lock().await = Some(entry);
     }
+
+    payload
 }
