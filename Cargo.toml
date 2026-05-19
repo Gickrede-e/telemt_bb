@@ -107,3 +107,27 @@ harness = false
 [profile.release]
 lto = "fat"
 codegen-units = 1
+# Strip debuginfo but KEEP function names. Smaller binary (~30-40% on
+# this codebase), faster downloads on deploy, and `perf top` / `eu-stack`
+# still show meaningful function names — which is the actually-useful
+# bit during a production incident. Backtraces from panics will show
+# function names but no line numbers; that's the right trade-off for a
+# proxy where source code is on a different machine anyway.
+#
+# `panic = "abort"` deliberately NOT set. The supervisor-restart pattern
+# in `me_startup.rs::spawn_shard_supervisor` and the health/drain/
+# watchdog tasks relies on `tokio::spawn(...).await` returning
+# `Err(JoinError)` to detect + restart panicked sub-tasks. With abort,
+# the first panic anywhere kills the whole process — taking down every
+# client connection. The supervisors are an architectural choice; we
+# keep unwinding to preserve them.
+strip = "debuginfo"
+
+# Operator opt-in profile for crash investigation: inherits everything
+# from release but keeps debug symbols so addr2line / gdb work. Build
+# with `cargo build --profile release-with-debug`. Binary is bigger
+# (~2-3×) so don't ship this to production by default.
+[profile.release-with-debug]
+inherits = "release"
+strip = "none"
+debug = "limited"

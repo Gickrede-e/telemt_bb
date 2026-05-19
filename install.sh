@@ -581,6 +581,24 @@ build_from_source() {
         die "$(printf "$L_ERR_CLONE_FAIL" "$REPO" "$_bfs_ref")"
     fi
 
+    # target-cpu=native enables AVX2/BMI2/AES-NI on the build host.
+    # telemt's crypto hot path (handshake AES, MTProto AEAD) sees
+    # meaningful speedup from AES-NI; the masking + buffer copy loops
+    # benefit from AVX2. Operator can override by exporting RUSTFLAGS
+    # before running this script if cross-host portability matters.
+    #
+    # `=` (not `:=`) so an explicitly-empty `RUSTFLAGS=""` is respected
+    # as "operator wants no flags" — useful for reproducing upstream
+    # builds.
+    : "${RUSTFLAGS=-C target-cpu=native}"
+    export RUSTFLAGS
+    # IMPORTANT: with target-cpu=native (the default here), the
+    # resulting binary will only run on this host's CPU or a strictly
+    # newer one. Build on the deploy host or pre-set RUSTFLAGS for
+    # cross-host portability — otherwise the first AES-NI/AVX2
+    # instruction triggers SIGILL on the smaller VPS, and the binary
+    # is stripped so the backtrace will say `<unknown>+0x...`.
+    printf '>>> Building with RUSTFLAGS=%s\n' "$RUSTFLAGS" >&2
     ( cd "$_bfs_srcdir" && cargo build --release --bin "$BIN_NAME" >&2 ) \
         || die "$L_ERR_BUILD_FAIL"
 
