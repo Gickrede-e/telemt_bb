@@ -586,8 +586,19 @@ build_from_source() {
     # meaningful speedup from AES-NI; the masking + buffer copy loops
     # benefit from AVX2. Operator can override by exporting RUSTFLAGS
     # before running this script if cross-host portability matters.
-    : "${RUSTFLAGS:=-C target-cpu=native}"
+    #
+    # `=` (not `:=`) so an explicitly-empty `RUSTFLAGS=""` is respected
+    # as "operator wants no flags" — useful for reproducing upstream
+    # builds.
+    : "${RUSTFLAGS=-C target-cpu=native}"
     export RUSTFLAGS
+    # IMPORTANT: with target-cpu=native (the default here), the
+    # resulting binary will only run on this host's CPU or a strictly
+    # newer one. Build on the deploy host or pre-set RUSTFLAGS for
+    # cross-host portability — otherwise the first AES-NI/AVX2
+    # instruction triggers SIGILL on the smaller VPS, and the binary
+    # is stripped so the backtrace will say `<unknown>+0x...`.
+    printf '>>> Building with RUSTFLAGS=%s\n' "$RUSTFLAGS" >&2
     ( cd "$_bfs_srcdir" && cargo build --release --bin "$BIN_NAME" >&2 ) \
         || die "$L_ERR_BUILD_FAIL"
 
