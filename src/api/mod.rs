@@ -60,8 +60,8 @@ use runtime_min::{
 };
 use runtime_selftest::build_runtime_me_selftest_data;
 use runtime_stats::{
-    MinimalCacheEntry, build_dcs_data, build_me_writers_by_shard_data, build_me_writers_data,
-    build_minimal_all_data, build_upstreams_data, build_zero_all_data,
+    ByShardCacheEntry, MinimalCacheEntry, build_dcs_data, build_me_writers_by_shard_data,
+    build_me_writers_data, build_minimal_all_data, build_upstreams_data, build_zero_all_data,
 };
 use runtime_watch::spawn_runtime_watchers;
 use runtime_zero::{
@@ -92,6 +92,7 @@ pub(super) struct ApiShared {
     pub(super) detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     pub(super) mutation_lock: Arc<Mutex<()>>,
     pub(super) minimal_cache: Arc<Mutex<Option<MinimalCacheEntry>>>,
+    pub(super) by_shard_cache: Arc<Mutex<Option<ByShardCacheEntry>>>,
     pub(super) runtime_edge_connections_cache: Arc<Mutex<Option<EdgeConnectionsCacheEntry>>>,
     pub(super) runtime_edge_recompute_lock: Arc<Mutex<()>>,
     pub(super) runtime_events: Arc<ApiEventStore>,
@@ -169,6 +170,7 @@ pub async fn serve(
         detected_ips_rx,
         mutation_lock: Arc::new(Mutex::new(())),
         minimal_cache: Arc::new(Mutex::new(None)),
+        by_shard_cache: Arc::new(Mutex::new(None)),
         runtime_edge_connections_cache: Arc::new(Mutex::new(None)),
         runtime_edge_recompute_lock: Arc::new(Mutex::new(())),
         runtime_events: Arc::new(ApiEventStore::new(

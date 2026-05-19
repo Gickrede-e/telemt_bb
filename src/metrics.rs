@@ -3731,7 +3731,7 @@ async fn render_per_shard_me_metrics(out: &mut String, mux: &MePoolMux) {
 
     let _ = writeln!(
         out,
-        "# HELP telemt_me_shard_alive_writers Per-shard live ME writers (labels: shard, bind)"
+        "# HELP telemt_me_shard_alive_writers Per-shard live ME writers (labels: shard, bind; bind empty for legacy single-pool)"
     );
     let _ = writeln!(out, "# TYPE telemt_me_shard_alive_writers gauge");
     for (idx, snap) in snaps.iter().enumerate() {
