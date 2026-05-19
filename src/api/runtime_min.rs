@@ -291,13 +291,12 @@ pub(super) async fn build_runtime_me_pool_state_data(shared: &ApiShared) -> Runt
         };
     };
 
-    // Status + runtime aggregate across shards (writer pools sum, DCs
-    // merge by id). Refill stays primary-only — that surface tracks
-    // in-flight refill operations which are shard-private and don't yet
-    // have a defined cross-shard semantic.
+    // System-wide view: every snapshot aggregates across shards.
+    // Refill counts sum (each shard's refill is a distinct connect
+    // attempt); writer pools sum; DCs merge by id with endpoint union.
     let status = mux.aggregate_status_snapshot().await;
     let runtime = mux.aggregate_runtime_snapshot().await;
-    let refill = mux.primary().api_refill_snapshot().await;
+    let refill = mux.aggregate_refill_snapshot().await;
 
     let mut draining_generations = BTreeSet::<u64>::new();
     let mut contour_warm = 0usize;

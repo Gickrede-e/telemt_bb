@@ -30,6 +30,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use super::pool::MePool;
+use super::pool_runtime_api::{MeApiRefillDcSnapshot, MeApiRefillSnapshot};
 use super::pool_status::{
     MeApiDcEndpointWriterSnapshot, MeApiDcStatusSnapshot, MeApiQuarantinedEndpointSnapshot,
     MeApiRuntimeSnapshot, MeApiStatusSnapshot,
@@ -127,14 +128,19 @@ impl MePoolMux {
     /// readers see the system-wide writer pool, not just shard 0.
     ///
     /// Aggregation rules (the ONLY interesting design surface in this fn):
-    ///   * **Counts that scale per-shard** (required_writers, alive_writers,
+    ///   * **Pool-state counts** (required_writers, alive_writers,
     ///     fresh_alive_writers): SUM across shards. Each shard has its own
     ///     writer pool; the system total is the sum.
-    ///   * **Counts that are config-derived and same across shards**
-    ///     (configured_dc_groups, configured_endpoints, available_endpoints):
-    ///     take from primary. All shards see the same Telegram proxy_config,
-    ///     so this is identical across shards.
-    ///   * **`available_pct`**: take from primary (config-derived).
+    ///   * **Config-derived counts** (configured_dc_groups,
+    ///     configured_endpoints): take from primary. All shards see the
+    ///     same Telegram proxy_config.
+    ///   * **`available_endpoints` and `available_pct`**: RECOMPUTED from
+    ///     the merged DC views, NOT taken from primary. An endpoint is
+    ///     "available" if at least one shard has a live writer to it; if
+    ///     shards cover disjoint endpoint subsets, primary's value would
+    ///     undercount the system's actual coverage. The DC-level union
+    ///     happens in `DcAccumulator::finalize`, the top-level sum in
+    ///     `merge_status_snapshots`.
     ///   * **`coverage_pct`, `fresh_coverage_pct`**: RECOMPUTED from the
     ///     summed numerator/denominator. A naïve average of per-shard
     ///     ratios would weight a shard with 1 writer the same as a shard
@@ -144,9 +150,11 @@ impl MePoolMux {
     ///     stale.
     ///   * **`writers: Vec`**: concatenate. Caller (api/runtime_stats) sees
     ///     N× more writers in shard mode; that's the correct view.
-    ///   * **`dcs: Vec`**: merge by `dc` key. For each DC, sum writer
-    ///     counts; merge endpoint sets (union); for endpoint_writers, sum
-    ///     per-endpoint writer counts across shards.
+    ///   * **`dcs: Vec`**: merge by `dc` key — pool-state counts sum,
+    ///     endpoint sets union, endpoint_writers sum per-endpoint, RTT
+    ///     takes min. floor_min/floor_max come from primary (config-
+    ///     derived, identical across shards) while floor_target sums
+    ///     (per-shard dynamic value).
     ///
     /// Single-shard fast path: clone primary's snapshot directly so the
     /// (default) round_robin mode pays zero overhead.
@@ -154,10 +162,18 @@ impl MePoolMux {
         if self.inner.shards.len() == 1 {
             return self.inner.shards[0].api_status_snapshot().await;
         }
-        let mut snaps = Vec::with_capacity(self.inner.shards.len());
-        for shard in &self.inner.shards {
-            snaps.push(shard.api_status_snapshot().await);
-        }
+        // Snapshot all shards concurrently. Each shard's RwLocks are
+        // independent Arcs so there's no lock contention between them;
+        // parallelism tightens the time window over which the merged view
+        // is assembled. A serial await loop would let a generation
+        // rotation slip in between shard 0 and shard N snapshots,
+        // producing an incoherent mix of "old" and "new" rotation states.
+        let futs = self
+            .inner
+            .shards
+            .iter()
+            .map(|shard| shard.api_status_snapshot());
+        let snaps = futures::future::join_all(futs).await;
         merge_status_snapshots(snaps)
     }
 
@@ -189,32 +205,84 @@ impl MePoolMux {
         if self.inner.shards.len() == 1 {
             return self.inner.shards[0].api_runtime_snapshot().await;
         }
-        let mut snaps = Vec::with_capacity(self.inner.shards.len());
-        for shard in &self.inner.shards {
-            snaps.push(shard.api_runtime_snapshot().await);
-        }
+        let futs = self
+            .inner
+            .shards
+            .iter()
+            .map(|shard| shard.api_runtime_snapshot());
+        let snaps = futures::future::join_all(futs).await;
         merge_runtime_snapshots(snaps)
+    }
+
+    /// Aggregate `api_refill_snapshot()` across shards. Counts sum
+    /// across shards — an endpoint refill in flight on shard A and the
+    /// same endpoint on shard B is reported as 2 inflight ops because
+    /// each is a separate connect attempt consuming its own socket
+    /// budget. Operator reading "inflight_endpoints_total = 5" should
+    /// understand it as "5 concurrent connect attempts," not "5 unique
+    /// endpoints affected".
+    ///
+    /// Single-shard fast path: pass through.
+    pub async fn aggregate_refill_snapshot(&self) -> MeApiRefillSnapshot {
+        if self.inner.shards.len() == 1 {
+            return self.inner.shards[0].api_refill_snapshot().await;
+        }
+        let futs = self
+            .inner
+            .shards
+            .iter()
+            .map(|shard| shard.api_refill_snapshot());
+        let snaps = futures::future::join_all(futs).await;
+        merge_refill_snapshots(snaps)
+    }
+}
+
+pub(crate) fn merge_refill_snapshots(snaps: Vec<MeApiRefillSnapshot>) -> MeApiRefillSnapshot {
+    assert!(
+        !snaps.is_empty(),
+        "merge_refill_snapshots requires ≥1 snapshot"
+    );
+    let inflight_endpoints_total: usize = snaps.iter().map(|s| s.inflight_endpoints_total).sum();
+    // by_dc merges by (dc, family); sum inflight counts because each
+    // shard's refill on the same DC is a distinct connect attempt.
+    let mut by_dc_acc: BTreeMap<(i16, &'static str), usize> = BTreeMap::new();
+    for snap in &snaps {
+        for entry in &snap.by_dc {
+            *by_dc_acc.entry((entry.dc, entry.family)).or_insert(0) += entry.inflight;
+        }
+    }
+    let by_dc: Vec<MeApiRefillDcSnapshot> = by_dc_acc
+        .into_iter()
+        .map(|((dc, family), inflight)| MeApiRefillDcSnapshot {
+            dc,
+            family,
+            inflight,
+        })
+        .collect();
+    let inflight_dc_total = by_dc.len();
+    MeApiRefillSnapshot {
+        inflight_endpoints_total,
+        inflight_dc_total,
+        by_dc,
     }
 }
 
 /// Status snapshot merge — extracted so it's pure-function-testable
 /// without spinning up real `MePool` instances.
 pub(crate) fn merge_status_snapshots(snaps: Vec<MeApiStatusSnapshot>) -> MeApiStatusSnapshot {
-    debug_assert!(
+    assert!(
         !snaps.is_empty(),
         "merge_status_snapshots requires ≥1 snapshot"
     );
-    // Anchor most config-shaped fields on the primary (snaps[0]) but sum
-    // writer-count fields and recompute coverages from the totals.
     let generated_at_epoch_secs = snaps
         .iter()
         .map(|s| s.generated_at_epoch_secs)
         .max()
         .unwrap_or_default();
+    // configured_dc_groups and configured_endpoints come from the global
+    // Telegram proxy config — identical across every shard.
     let configured_dc_groups = snaps[0].configured_dc_groups;
     let configured_endpoints = snaps[0].configured_endpoints;
-    let available_endpoints = snaps[0].available_endpoints;
-    let available_pct = snaps[0].available_pct;
     let required_writers: usize = snaps.iter().map(|s| s.required_writers).sum();
     let alive_writers: usize = snaps.iter().map(|s| s.alive_writers).sum();
     let fresh_alive_writers: usize = snaps.iter().map(|s| s.fresh_alive_writers).sum();
@@ -232,7 +300,18 @@ pub(crate) fn merge_status_snapshots(snaps: Vec<MeApiStatusSnapshot>) -> MeApiSt
                 .absorb(dc);
         }
     }
-    let dcs = dc_acc.into_values().map(DcAccumulator::finalize).collect();
+    let dcs: Vec<MeApiDcStatusSnapshot> =
+        dc_acc.into_values().map(DcAccumulator::finalize).collect();
+
+    // available_endpoints is endpoint-coverage state, NOT config — an
+    // endpoint is "available" if at least one shard has a live writer to
+    // it. Sum per-DC counts (each DC's finalize() already counts unique
+    // endpoints with active writers via merged endpoint_writers).
+    // Recomputing from the merged DCs prevents the under-counting bug
+    // that taking primary's `available_endpoints` would cause when
+    // shards cover disjoint endpoint subsets.
+    let available_endpoints: usize = dcs.iter().map(|d| d.available_endpoints).sum();
+    let available_pct = pct_or_zero(available_endpoints, configured_endpoints);
 
     MeApiStatusSnapshot {
         generated_at_epoch_secs,
@@ -273,7 +352,8 @@ pub(crate) fn merge_runtime_snapshots(snaps: Vec<MeApiRuntimeSnapshot>) -> MeApi
         .filter_map(|s| s.pending_hardswap_age_secs)
         .max();
 
-    // Writer-count totals (sum)
+    // Pool-state-derived totals (sum). These count actual writers held
+    // across shards' independent pools.
     let adaptive_floor_active_writers_current: u64 = snaps
         .iter()
         .map(|s| s.adaptive_floor_active_writers_current)
@@ -282,32 +362,25 @@ pub(crate) fn merge_runtime_snapshots(snaps: Vec<MeApiRuntimeSnapshot>) -> MeApi
         .iter()
         .map(|s| s.adaptive_floor_warm_writers_current)
         .sum();
+    // target_writers_total is the sum of dc_required_writers across DCs
+    // within ONE shard. Each shard's adaptive floor sets its own per-DC
+    // target based on its own load signal, so the system target is the
+    // sum of per-shard targets.
     let adaptive_floor_target_writers_total: u64 = snaps
         .iter()
         .map(|s| s.adaptive_floor_target_writers_total)
         .sum();
-    let adaptive_floor_global_cap_raw: u64 =
-        snaps.iter().map(|s| s.adaptive_floor_global_cap_raw).sum();
-    let adaptive_floor_global_cap_effective: u64 = snaps
-        .iter()
-        .map(|s| s.adaptive_floor_global_cap_effective)
-        .sum();
-    let adaptive_floor_active_cap_configured: u64 = snaps
-        .iter()
-        .map(|s| s.adaptive_floor_active_cap_configured)
-        .sum();
-    let adaptive_floor_active_cap_effective: u64 = snaps
-        .iter()
-        .map(|s| s.adaptive_floor_active_cap_effective)
-        .sum();
-    let adaptive_floor_warm_cap_configured: u64 = snaps
-        .iter()
-        .map(|s| s.adaptive_floor_warm_cap_configured)
-        .sum();
-    let adaptive_floor_warm_cap_effective: u64 = snaps
-        .iter()
-        .map(|s| s.adaptive_floor_warm_cap_effective)
-        .sum();
+    // Caps below are operator-config-derived. Each shard loads the same
+    // config into its own `floor_runtime` atomics, so the values are
+    // duplicated across shards — summing inflates them N× and breaks
+    // operator-dashboard comparisons like `target vs cap`. Take primary.
+    let primary_rt = &snaps[0];
+    let adaptive_floor_global_cap_raw = primary_rt.adaptive_floor_global_cap_raw;
+    let adaptive_floor_global_cap_effective = primary_rt.adaptive_floor_global_cap_effective;
+    let adaptive_floor_active_cap_configured = primary_rt.adaptive_floor_active_cap_configured;
+    let adaptive_floor_active_cap_effective = primary_rt.adaptive_floor_active_cap_effective;
+    let adaptive_floor_warm_cap_configured = primary_rt.adaptive_floor_warm_cap_configured;
+    let adaptive_floor_warm_cap_effective = primary_rt.adaptive_floor_warm_cap_effective;
 
     // Quarantine union: by endpoint, max(remaining_ms).
     let mut q_acc: HashMap<SocketAddr, u64> = HashMap::new();
@@ -405,17 +478,15 @@ struct DcAccumulator {
     dc: i16,
     endpoints: std::collections::BTreeSet<SocketAddr>,
     endpoint_writers: HashMap<SocketAddr, usize>,
-    available_endpoints: usize,
     required_writers: usize,
-    floor_min: usize,
+    floor_min_primary: usize,
     floor_target: usize,
-    floor_max: usize,
+    floor_max_primary: usize,
     floor_capped: bool,
     alive_writers: usize,
     fresh_alive_writers: usize,
     load: usize,
     rtt_ms_min: Option<f64>,
-    available_pct_primary: f64,
     seen: usize,
 }
 
@@ -425,28 +496,34 @@ impl DcAccumulator {
             dc: 0,
             endpoints: Default::default(),
             endpoint_writers: HashMap::new(),
-            available_endpoints: 0,
             required_writers: 0,
-            floor_min: 0,
+            floor_min_primary: 0,
             floor_target: 0,
-            floor_max: 0,
+            floor_max_primary: 0,
             floor_capped: false,
             alive_writers: 0,
             fresh_alive_writers: 0,
             load: 0,
             rtt_ms_min: None,
-            available_pct_primary: 0.0,
             seen: 0,
         }
     }
 
     fn absorb(&mut self, snap: MeApiDcStatusSnapshot) {
         if self.seen == 0 {
-            // Anchor identity + config-shaped fields on the first shard
-            // contributing this DC. Subsequent shards see the SAME config
-            // (same proxy_config), so these stay consistent.
+            // Anchor config-shaped fields on the first shard contributing
+            // this DC. All shards see the SAME operator config and proxy
+            // config, so these stay consistent.
+            //   * floor_min / floor_max are computed from
+            //     me_adaptive_floor_*_per_endpoint config + core count —
+            //     identical across shards. Summing 6× would inflate the
+            //     visible floor and break alert thresholds.
+            //   * available_pct at the DC level is recomputed in finalize()
+            //     from the merged endpoint set; primary's value here is
+            //     never propagated.
             self.dc = snap.dc;
-            self.available_pct_primary = snap.available_pct;
+            self.floor_min_primary = snap.floor_min;
+            self.floor_max_primary = snap.floor_max;
         }
         self.seen += 1;
         for ep in snap.endpoints {
@@ -455,12 +532,13 @@ impl DcAccumulator {
         for ew in snap.endpoint_writers {
             *self.endpoint_writers.entry(ew.endpoint).or_insert(0) += ew.active_writers;
         }
-        // Writer counts sum.
-        self.available_endpoints = self.available_endpoints.max(snap.available_endpoints);
+        // Pool-state-derived counts: SUM across shards.
         self.required_writers += snap.required_writers;
-        self.floor_min += snap.floor_min;
+        // floor_target IS dc_required_writers from pool_status — per-shard
+        // dynamic value driven by each shard's adaptive floor. Sum across
+        // shards to get the system-wide target.
         self.floor_target += snap.floor_target;
-        self.floor_max += snap.floor_max;
+        // floor_capped: OR — DC is capped if ANY shard hit the cap.
         self.floor_capped = self.floor_capped || snap.floor_capped;
         self.alive_writers += snap.alive_writers;
         self.fresh_alive_writers += snap.fresh_alive_writers;
@@ -477,6 +555,7 @@ impl DcAccumulator {
 
     fn finalize(self) -> MeApiDcStatusSnapshot {
         let endpoints: Vec<SocketAddr> = self.endpoints.into_iter().collect();
+        let endpoint_count = endpoints.len();
         let mut endpoint_writers: Vec<MeApiDcEndpointWriterSnapshot> = self
             .endpoint_writers
             .into_iter()
@@ -486,16 +565,26 @@ impl DcAccumulator {
             })
             .collect();
         endpoint_writers.sort_by_key(|e| e.endpoint);
+        // available_endpoints: unique endpoints with at least one live
+        // writer across any shard. Recomputed from merged endpoint_writers
+        // rather than max'ing per-shard counts — handles the disjoint-
+        // endpoint-coverage case (shard A covers ep1, shard B covers ep2:
+        // merged should report 2, not max(1,1)=1).
+        let available_endpoints = endpoint_writers
+            .iter()
+            .filter(|ew| ew.active_writers > 0)
+            .count();
+        let available_pct = pct_or_zero(available_endpoints, endpoint_count);
         MeApiDcStatusSnapshot {
             dc: self.dc,
             endpoints,
             endpoint_writers,
-            available_endpoints: self.available_endpoints,
-            available_pct: self.available_pct_primary,
+            available_endpoints,
+            available_pct,
             required_writers: self.required_writers,
-            floor_min: self.floor_min,
+            floor_min: self.floor_min_primary,
             floor_target: self.floor_target,
-            floor_max: self.floor_max,
+            floor_max: self.floor_max_primary,
             floor_capped: self.floor_capped,
             alive_writers: self.alive_writers,
             coverage_pct: pct_or_zero(self.alive_writers, self.required_writers),
@@ -626,7 +715,7 @@ mod aggregation_tests {
     //! run in microseconds and can exhaustively cover edge cases.
     use super::{
         MeApiDcEndpointWriterSnapshot, MeApiDcStatusSnapshot, MeApiQuarantinedEndpointSnapshot,
-        MeApiRuntimeSnapshot, MeApiStatusSnapshot,
+        MeApiRefillSnapshot, MeApiRuntimeSnapshot, MeApiStatusSnapshot,
     };
     use super::{merge_runtime_snapshots, merge_status_snapshots};
     use std::net::SocketAddr;
@@ -813,6 +902,144 @@ mod aggregation_tests {
     }
 
     #[test]
+    fn dcs_disjoint_endpoints_across_shards_union_into_merged_set() {
+        // Shard A covers ep1 in DC -2, shard B covers ep2 in DC -2 — two
+        // operator-distinct endpoints. The merged DC must report BOTH
+        // endpoints and 2 active_writers total. A naïve "take max
+        // available_endpoints across shards" would report 1 — the bug
+        // pattern the merge change is fixing.
+        let a = status_snap(
+            100,
+            2,
+            1,
+            1,
+            vec![dc_snap(-2, 2, 1, 1, vec![ep("1.1.1.1:443")], None)],
+        );
+        let b = status_snap(
+            100,
+            2,
+            1,
+            1,
+            vec![dc_snap(-2, 2, 1, 1, vec![ep("1.1.1.2:443")], None)],
+        );
+        let merged = merge_status_snapshots(vec![a, b]);
+        assert_eq!(merged.dcs.len(), 1);
+        let dc = &merged.dcs[0];
+        assert_eq!(dc.endpoints.len(), 2, "endpoint union should hold both");
+        assert_eq!(
+            dc.endpoint_writers.len(),
+            2,
+            "two distinct endpoints contributed writers"
+        );
+        assert_eq!(
+            dc.available_endpoints, 2,
+            "both endpoints alive: available count is union"
+        );
+        // available_pct at DC level: 2 alive of 2 known = 100%.
+        assert!((dc.available_pct - 100.0).abs() < 1e-9);
+        // Top-level available_endpoints sums DC-level counts.
+        assert_eq!(merged.available_endpoints, 2);
+    }
+
+    #[test]
+    fn dc_floor_min_max_take_primary_not_sum() {
+        // floor_min and floor_max are config-derived (per-endpoint mins
+        // + cores * extra_per_core). All shards load the same operator
+        // config and produce the same floor_min/max. Summing them would
+        // 6× the visible floor and break operator alert thresholds.
+        // floor_target IS per-shard adaptive (dc_required_writers) and
+        // does sum.
+        let a = status_snap(
+            100,
+            6,
+            6,
+            6,
+            vec![MeApiDcStatusSnapshot {
+                dc: -2,
+                endpoints: vec![],
+                endpoint_writers: vec![],
+                available_endpoints: 1,
+                available_pct: 100.0,
+                required_writers: 3,
+                floor_min: 2,
+                floor_target: 3,
+                floor_max: 8,
+                floor_capped: false,
+                alive_writers: 3,
+                coverage_pct: 0.0,
+                fresh_alive_writers: 3,
+                fresh_coverage_pct: 0.0,
+                rtt_ms: None,
+                load: 0,
+            }],
+        );
+        let b = status_snap(
+            100,
+            6,
+            6,
+            6,
+            vec![MeApiDcStatusSnapshot {
+                dc: -2,
+                endpoints: vec![],
+                endpoint_writers: vec![],
+                available_endpoints: 1,
+                available_pct: 100.0,
+                required_writers: 3,
+                floor_min: 2,
+                floor_target: 3,
+                floor_max: 8,
+                floor_capped: true, // OR'd in finalize
+                alive_writers: 3,
+                coverage_pct: 0.0,
+                fresh_alive_writers: 3,
+                fresh_coverage_pct: 0.0,
+                rtt_ms: None,
+                load: 0,
+            }],
+        );
+        let merged = merge_status_snapshots(vec![a, b]);
+        let dc = &merged.dcs[0];
+        assert_eq!(dc.floor_min, 2, "floor_min from primary, not 2+2=4");
+        assert_eq!(dc.floor_max, 8, "floor_max from primary, not 8+8=16");
+        // floor_target sums: per-shard dynamic value.
+        assert_eq!(dc.floor_target, 6, "3 + 3 from per-shard adaptive");
+        assert!(dc.floor_capped, "OR across shards");
+    }
+
+    #[test]
+    fn runtime_caps_take_primary_not_sum() {
+        // global_cap_* and active/warm_cap_* are config-derived
+        // duplicated per-shard atomics. Summing them N× would inflate
+        // the cap and break the `target vs cap` invariant operators rely
+        // on for capacity planning. Only *_writers_current and
+        // target_writers_total are pool-state-derived and should sum.
+        let mut a = empty_runtime();
+        a.adaptive_floor_global_cap_raw = 1000;
+        a.adaptive_floor_global_cap_effective = 800;
+        a.adaptive_floor_active_cap_configured = 600;
+        a.adaptive_floor_active_cap_effective = 500;
+        a.adaptive_floor_warm_cap_configured = 200;
+        a.adaptive_floor_warm_cap_effective = 150;
+        // target IS per-shard dynamic — sum it.
+        a.adaptive_floor_target_writers_total = 60;
+        a.adaptive_floor_active_writers_current = 55;
+        let b = a.clone();
+        let merged = merge_runtime_snapshots(vec![a, b]);
+        assert_eq!(
+            merged.adaptive_floor_global_cap_raw, 1000,
+            "primary, not 2000"
+        );
+        assert_eq!(merged.adaptive_floor_global_cap_effective, 800);
+        assert_eq!(merged.adaptive_floor_active_cap_configured, 600);
+        assert_eq!(merged.adaptive_floor_active_cap_effective, 500);
+        assert_eq!(merged.adaptive_floor_warm_cap_configured, 200);
+        assert_eq!(merged.adaptive_floor_warm_cap_effective, 150);
+        // SUM cases:
+        assert_eq!(merged.adaptive_floor_target_writers_total, 120);
+        assert_eq!(merged.adaptive_floor_active_writers_current, 110);
+    }
+
+    #[test]
     fn dcs_present_in_only_one_shard_still_appear_in_merge() {
         // Edge case: one shard sees DC 5 (perhaps because its source IP
         // is the only one with that DC routable). The merged view must
@@ -962,6 +1189,58 @@ mod aggregation_tests {
             .find(|q| q.endpoint == ep("9.9.9.9:443"))
             .unwrap();
         assert_eq!(nines.remaining_ms, 12000, "should take max remaining");
+    }
+
+    #[test]
+    fn refill_inflight_counts_sum_and_dc_merges_by_key() {
+        // Operator-visible refill view must show system-wide load. Two
+        // shards each with 3 in-flight refills means the system has 6
+        // concurrent connect attempts consuming socket budget; primary-
+        // only reporting would lie about half of them. by_dc merges by
+        // (dc, family) and sums inflight counts.
+        use super::super::pool_runtime_api::MeApiRefillDcSnapshot;
+        let a = MeApiRefillSnapshot {
+            inflight_endpoints_total: 3,
+            inflight_dc_total: 2,
+            by_dc: vec![
+                MeApiRefillDcSnapshot {
+                    dc: -2,
+                    family: "v4",
+                    inflight: 2,
+                },
+                MeApiRefillDcSnapshot {
+                    dc: 2,
+                    family: "v4",
+                    inflight: 1,
+                },
+            ],
+        };
+        let b = MeApiRefillSnapshot {
+            inflight_endpoints_total: 3,
+            inflight_dc_total: 2,
+            by_dc: vec![
+                MeApiRefillDcSnapshot {
+                    dc: -2,
+                    family: "v4",
+                    inflight: 1,
+                },
+                MeApiRefillDcSnapshot {
+                    dc: -2,
+                    family: "v6",
+                    inflight: 2,
+                },
+            ],
+        };
+        let merged = super::merge_refill_snapshots(vec![a, b]);
+        assert_eq!(merged.inflight_endpoints_total, 6);
+        // Three distinct (dc, family) keys: (-2,v4), (2,v4), (-2,v6).
+        assert_eq!(merged.inflight_dc_total, 3);
+        let neg2_v4 = merged
+            .by_dc
+            .iter()
+            .find(|e| e.dc == -2 && e.family == "v4")
+            .unwrap();
+        assert_eq!(neg2_v4.inflight, 3, "2 + 1 = 3");
     }
 
     #[test]
