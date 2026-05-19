@@ -2157,7 +2157,10 @@ mod tests {
         let counter = std::sync::atomic::AtomicUsize::new(0);
         let bind = UpstreamManager::resolve_bind_address(
             &None,
-            &Some(vec!["198.51.100.10".to_string(), "198.51.100.11".to_string()]),
+            &Some(vec![
+                "198.51.100.10".to_string(),
+                "198.51.100.11".to_string(),
+            ]),
             target,
             Some(&counter),
             false,
