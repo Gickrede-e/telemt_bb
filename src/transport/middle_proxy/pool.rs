@@ -444,6 +444,12 @@ pub struct MePool {
     pub(super) endpoint_quarantine: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     pub(super) kdf_material_fingerprint: Arc<RwLock<HashMap<SocketAddr, (u64, u16)>>>,
     pub(super) runtime_ready: AtomicBool,
+    /// When Some, every outbound writer this pool creates binds to this
+    /// source IP — overrides UpstreamManager's round-robin selection.
+    /// Set by `me_writer_bind_mode = "shard"` startup so that an N-pool
+    /// MePoolMux pins shard N to bind_addresses[N]. None preserves the
+    /// pre-sharding behaviour (rr / single bind).
+    pub(super) shard_bind_override: Option<IpAddr>,
     pool_size: usize,
 }
 
@@ -575,6 +581,7 @@ impl MePool {
         me_route_blocking_send_timeout_ms: u64,
         me_route_inline_recovery_attempts: u32,
         me_route_inline_recovery_wait_ms: u64,
+        shard_bind_override: Option<IpAddr>,
     ) -> Arc<Self> {
         let endpoint_dc_map = Self::build_endpoint_dc_map_from_maps(&proxy_map_v4, &proxy_map_v6);
         let preferred_endpoints_by_dc =
@@ -835,6 +842,7 @@ impl MePool {
             endpoint_quarantine: Arc::new(Mutex::new(HashMap::new())),
             kdf_material_fingerprint: Arc::new(RwLock::new(HashMap::new())),
             runtime_ready: AtomicBool::new(false),
+            shard_bind_override,
         })
     }
 

@@ -156,7 +156,9 @@ impl MePool {
             } else {
                 self.resolve_dc_idx_for_endpoint(addr).await
             };
-            let (stream, egress) = upstream.connect_with_details(addr, dc_idx, None).await?;
+            let (stream, egress) = upstream
+                .connect_with_details(addr, dc_idx, None, self.shard_bind_override)
+                .await?;
             (stream, Some(egress))
         } else {
             let connect_fut = async {

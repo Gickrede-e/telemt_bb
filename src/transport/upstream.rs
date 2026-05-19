@@ -601,8 +601,24 @@ impl UpstreamManager {
         target: SocketAddr,
         rr: Option<&AtomicUsize>,
         validate_ip_on_interface: bool,
+        override_bind: Option<IpAddr>,
     ) -> Option<IpAddr> {
         let want_ipv6 = target.is_ipv6();
+
+        // Per-shard pinning: when a MePool has been constructed with a
+        // single bind_addresses entry to isolate it to one source IP,
+        // every connect carries that IP as `override_bind`. We short-
+        // circuit before touching rr/interface logic so the override is
+        // truly authoritative — round-robin can never leak the shard onto
+        // a sibling's IP. The override is silently ignored if the address
+        // family doesn't match the target (dual-stack endpoint with only
+        // one bind family available); callers then fall through to the
+        // normal selection path.
+        if let Some(ip) = override_bind
+            && ip.is_ipv6() == want_ipv6
+        {
+            return Some(ip);
+        }
 
         if let Some(addrs) = bind_addresses.as_ref().filter(|v| !v.is_empty()) {
             let mut candidates: Vec<IpAddr> = addrs
@@ -865,7 +881,7 @@ impl UpstreamManager {
         };
 
         let (stream, _) = self
-            .connect_selected_upstream(idx, upstream, target, dc_idx, bind_rr)
+            .connect_selected_upstream(idx, upstream, target, dc_idx, bind_rr, None)
             .await?;
         Ok(stream)
     }
@@ -876,6 +892,7 @@ impl UpstreamManager {
         target: SocketAddr,
         dc_idx: Option<i16>,
         scope: Option<&str>,
+        override_bind: Option<IpAddr>,
     ) -> Result<(TcpStream, UpstreamEgressInfo)> {
         let idx = self
             .select_upstream(dc_idx, scope)
@@ -908,7 +925,7 @@ impl UpstreamManager {
         };
 
         let (stream, egress) = self
-            .connect_selected_upstream(idx, upstream, target, dc_idx, bind_rr)
+            .connect_selected_upstream(idx, upstream, target, dc_idx, bind_rr, override_bind)
             .await?;
         Ok((stream.into_tcp()?, egress))
     }
@@ -920,6 +937,7 @@ impl UpstreamManager {
         target: SocketAddr,
         dc_idx: Option<i16>,
         bind_rr: Option<Arc<AtomicUsize>>,
+        override_bind: Option<IpAddr>,
     ) -> Result<(UpstreamStream, UpstreamEgressInfo)> {
         let connect_started_at = Instant::now();
         let mut last_error: Option<ProxyError> = None;
@@ -945,7 +963,14 @@ impl UpstreamManager {
             self.stats.increment_upstream_connect_attempt_total();
             let start = Instant::now();
             match self
-                .connect_via_upstream(idx, &upstream, target, bind_rr.clone(), attempt_timeout)
+                .connect_via_upstream(
+                    idx,
+                    &upstream,
+                    target,
+                    bind_rr.clone(),
+                    attempt_timeout,
+                    override_bind,
+                )
                 .await
             {
                 Ok((stream, egress)) => {
@@ -1057,6 +1082,7 @@ impl UpstreamManager {
         target: SocketAddr,
         bind_rr: Option<Arc<AtomicUsize>>,
         connect_timeout: Duration,
+        override_bind: Option<IpAddr>,
     ) -> Result<(UpstreamStream, UpstreamEgressInfo)> {
         match &config.upstream_type {
             UpstreamType::Direct {
@@ -1070,6 +1096,7 @@ impl UpstreamManager {
                     target,
                     bind_rr.as_deref(),
                     true,
+                    override_bind,
                 );
                 if bind_ip.is_none() && bind_addresses.as_ref().is_some_and(|v| !v.is_empty()) {
                     return Err(ProxyError::Config(format!(
@@ -1140,6 +1167,7 @@ impl UpstreamManager {
                         proxy_addr,
                         bind_rr.as_deref(),
                         false,
+                        override_bind,
                     );
 
                     let socket = create_outgoing_socket_bound(proxy_addr, bind_ip)?;
@@ -1228,6 +1256,7 @@ impl UpstreamManager {
                         proxy_addr,
                         bind_rr.as_deref(),
                         false,
+                        override_bind,
                     );
 
                     let socket = create_outgoing_socket_bound(proxy_addr, bind_ip)?;
@@ -1622,6 +1651,7 @@ impl UpstreamManager {
                 target,
                 bind_rr,
                 Duration::from_secs(DC_PING_TIMEOUT_SECS),
+                None,
             )
             .await?;
         Ok(start.elapsed().as_secs_f64() * 1000.0)
@@ -1835,6 +1865,7 @@ impl UpstreamManager {
                                     endpoint,
                                     Some(bind_rr.clone()),
                                     Duration::from_secs(HEALTH_CHECK_CONNECT_TIMEOUT_SECS),
+                                    None,
                                 ),
                             )
                             .await;
@@ -2094,6 +2125,7 @@ mod tests {
             target,
             None,
             true,
+            None,
         );
 
         assert_eq!(bind, Some("198.51.100.10".parse::<IpAddr>().unwrap()));
@@ -2108,9 +2140,52 @@ mod tests {
             target,
             None,
             true,
+            None,
         );
 
         assert_eq!(bind, None);
+    }
+
+    #[test]
+    fn resolve_bind_address_override_short_circuits_round_robin() {
+        // Pin the per-shard test: when override_bind is Some and the family
+        // matches, bind_addresses + rr are ignored entirely. Without this
+        // pin, a code change that re-orders the function body (e.g.
+        // applies rr first) could silently break shard isolation —
+        // shard N would round-robin onto shard M's source IP.
+        let target = "203.0.113.10:443".parse::<SocketAddr>().unwrap();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let bind = UpstreamManager::resolve_bind_address(
+            &None,
+            &Some(vec![
+                "198.51.100.10".to_string(),
+                "198.51.100.11".to_string(),
+            ]),
+            target,
+            Some(&counter),
+            false,
+            Some("198.51.100.99".parse::<IpAddr>().unwrap()),
+        );
+        assert_eq!(bind, Some("198.51.100.99".parse::<IpAddr>().unwrap()));
+        // Override path must not advance the rr counter.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn resolve_bind_address_override_skipped_on_family_mismatch() {
+        // If operator pinned shard to an IPv4 and the target endpoint is
+        // IPv6-only, the override must NOT be forced (would fail bind);
+        // we fall through to the normal selection path instead.
+        let target = "[2001:db8::10]:443".parse::<SocketAddr>().unwrap();
+        let bind = UpstreamManager::resolve_bind_address(
+            &None,
+            &Some(vec!["2001:db8::cafe".to_string()]),
+            target,
+            None,
+            false,
+            Some("198.51.100.99".parse::<IpAddr>().unwrap()),
+        );
+        assert_eq!(bind, Some("2001:db8::cafe".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
