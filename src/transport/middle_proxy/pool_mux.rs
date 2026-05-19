@@ -122,7 +122,10 @@ impl MePoolMux {
 
 fn canonicalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         other => other,
     }
 }
@@ -154,7 +157,10 @@ mod tests {
     #[test]
     fn single_shard_always_returns_zero() {
         assert_eq!(shard_index_for(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 1), 0);
-        assert_eq!(shard_index_for(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 1), 0);
+        assert_eq!(
+            shard_index_for(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 1),
+            0
+        );
         // Degenerate zero-shard case — caller should never invoke this in
         // production but the helper must not panic.
         assert_eq!(shard_index_for(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 0), 0);
