@@ -368,7 +368,11 @@ pub(super) struct DcStatusData {
 /// We deliberately do NOT include the full writers Vec here — that
 /// would explode the payload (potentially thousands per shard × N
 /// shards). Operators who want per-writer detail can hit the existing
-/// `/v1/stats/me-writers` and filter client-side.
+/// `/v1/stats/me-writers` and filter client-side. The `summary` and
+/// `dcs` give the authoritative writer counts (alive, required, fresh,
+/// coverage) — adding a `writers_count` field would just duplicate
+/// info already present in `summary.alive_writers` plus dead writer
+/// slots, which has no defined cross-shard semantic.
 #[derive(Serialize, Clone)]
 pub(super) struct ShardEntry {
     pub(super) shard_idx: usize,
@@ -376,11 +380,6 @@ pub(super) struct ShardEntry {
     pub(super) bind_address: Option<String>,
     pub(super) summary: MeWritersSummary,
     pub(super) dcs: Vec<DcStatus>,
-    /// Number of writers in this shard's `writers` Vec on the aggregated
-    /// endpoint — operators use this to confirm shard-level writer
-    /// counts add up to the system total without fetching the full
-    /// writers Vec.
-    pub(super) writers_count: usize,
 }
 
 #[derive(Serialize, Clone)]
