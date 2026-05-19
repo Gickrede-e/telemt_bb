@@ -214,6 +214,29 @@ impl MePoolMux {
         merge_runtime_snapshots(snaps)
     }
 
+    /// Per-shard status snapshots, parallel to `shards()`. Each entry's
+    /// position in the returned `Vec` is the shard index. Use this when
+    /// you need the per-shard view (Prometheus labels, /v1/stats/me-
+    /// writers/by-shard, debug dashboards) — for the aggregated view
+    /// prefer `aggregate_status_snapshot()`.
+    ///
+    /// Implementation: `join_all` over `shard.api_status_snapshot()` so
+    /// every shard's RwLock is held within the same tight window. Serial
+    /// awaits would let a rotation slip between shard 0 and shard N,
+    /// producing a snapshot that mixes pre/post-rotation states across
+    /// shards. The single-shard fast path skips the join machinery.
+    pub async fn per_shard_status_snapshots(&self) -> Vec<MeApiStatusSnapshot> {
+        if self.inner.shards.len() == 1 {
+            return vec![self.inner.shards[0].api_status_snapshot().await];
+        }
+        let futs = self
+            .inner
+            .shards
+            .iter()
+            .map(|shard| shard.api_status_snapshot());
+        futures::future::join_all(futs).await
+    }
+
     /// Aggregate `api_refill_snapshot()` across shards. Counts sum
     /// across shards — an endpoint refill in flight on shard A and the
     /// same endpoint on shard B is reported as 2 inflight ops because

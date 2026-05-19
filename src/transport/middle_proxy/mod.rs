@@ -62,8 +62,16 @@ pub use ping::{
 };
 pub use pool::MePool;
 pub use pool_mux::MePoolMux;
+// Snapshot types are re-exported (crate-local) for the API layer's
+// per-shard endpoint and the metrics renderer — both need to map
+// internal snapshot fields to wire format. Inner visibility is
+// `pub(crate)` so the re-export must match.
 #[allow(unused_imports)]
 pub use pool_nat::{detect_public_ip, stun_probe};
+pub(crate) use pool_status::{
+    MeApiDcEndpointWriterSnapshot, MeApiDcStatusSnapshot, MeApiStatusSnapshot,
+    MeApiWriterStatusSnapshot,
+};
 pub use registry::ConnRegistry;
 pub use rotation::{MeReinitTrigger, me_reinit_scheduler, me_rotation_task};
 #[allow(unused_imports)]
