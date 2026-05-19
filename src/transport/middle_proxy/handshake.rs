@@ -203,6 +203,13 @@ impl MePool {
         if let Err(e) = Self::configure_user_timeout(stream.as_raw_fd()) {
             warn!(error = %e, "ME TCP_USER_TIMEOUT setup failed");
         }
+        #[cfg(target_os = "linux")]
+        if let Err(e) = Self::configure_quickack(stream.as_raw_fd()) {
+            // QUICKACK is purely a latency hint — degrades gracefully to
+            // default delayed-ACKs. Don't spam logs on every connect if
+            // the kernel rejects it (e.g. unprivileged container).
+            tracing::debug!(error = %e, "ME TCP_QUICKACK setup failed (latency may be slightly higher)");
+        }
         Ok((stream, connect_ms, upstream_egress))
     }
 
@@ -243,6 +250,40 @@ impl MePool {
                 libc::TCP_USER_TIMEOUT,
                 &timeout_ms as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&timeout_ms) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Enable TCP_QUICKACK on a freshly-connected outbound TG socket.
+    ///
+    /// By default Linux uses delayed ACKs (40 ms maximum) on
+    /// established sockets, which optimises bulk-data scenarios but adds
+    /// latency to small request/response patterns. ME writers are
+    /// exactly that pattern — short MTProto messages bounced through
+    /// Telegram's middle-proxy infrastructure where the first byte of a
+    /// reply may be delayed up to one ack-cycle. Enabling QUICKACK on
+    /// connect drops the artificial pause for the next few segments
+    /// (kernel clears the flag automatically once delayed-ACK quirks
+    /// suggest it's no longer beneficial).
+    ///
+    /// The setsockopt is best-effort: failing kernels (non-Linux, old
+    /// LXC namespaces with seccomp filters) just keep the default
+    /// delayed-ACK behaviour. We log at warn level and continue — never
+    /// fail-close on a perf hint.
+    #[cfg(target_os = "linux")]
+    fn configure_quickack(fd: RawFd) -> std::io::Result<()> {
+        let on: c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&on) as libc::socklen_t,
             )
         };
         if rc != 0 {

@@ -110,6 +110,47 @@ pub fn set_linger_zero(stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// Enable TCP_QUICKACK on a freshly-established socket (Linux only).
+///
+/// Linux's TCP stack uses delayed ACKs by default — up to ~40 ms of
+/// pause before ACK'ing a small segment in the hope of piggybacking the
+/// ACK on outbound data. That trade-off is wrong for an MTProto proxy
+/// where the typical exchange is short request/response patterns: every
+/// delayed ACK directly extends user-perceived latency on the next
+/// reply. QUICKACK tells the kernel to send the ACK immediately for the
+/// next few segments; it auto-clears once the stack believes delayed
+/// ACKs would help again, so we re-apply on every fresh connection.
+///
+/// Best-effort: failure (non-Linux, restricted seccomp, etc.) leaves
+/// the socket on default delayed-ACK behaviour. We never fail-close on
+/// a perf hint.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_quickack(stream: &TcpStream) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let on: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// No-op shim for non-Linux platforms — TCP_QUICKACK is a Linux-only
+/// socket option; macOS/BSD have different mechanisms or none at all.
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_quickack(_stream: &TcpStream) -> Result<()> {
+    Ok(())
+}
+
 /// Restore default linger behaviour (graceful FIN) on a socket
 /// identified by its raw file descriptor.  Safe to call after
 /// `TcpStream::into_split()` because the fd remains valid until
@@ -499,6 +540,30 @@ mod tests {
     use std::io::ErrorKind;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn set_tcp_quickack_succeeds_on_live_socket() {
+        // QUICKACK is a perf hint, not a correctness change; the test
+        // just verifies the setsockopt syscall succeeds on a freshly
+        // established loopback socket. A future refactor that, for
+        // instance, accidentally passes the wrong protocol level
+        // (IPPROTO_IP instead of IPPROTO_TCP) would surface here as
+        // EINVAL. Skip on non-Linux where the function is a no-op.
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("bind failed: {e}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        let client = client.expect("connect");
+        let (server, _) = accepted.expect("accept");
+        // Both ends should accept QUICKACK without error.
+        set_tcp_quickack(&client).expect("client QUICKACK");
+        set_tcp_quickack(&server).expect("server QUICKACK");
+    }
 
     #[tokio::test]
     async fn test_configure_socket() {

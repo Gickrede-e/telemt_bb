@@ -21,7 +21,7 @@ use crate::stats::{ReplayChecker, Stats};
 use crate::stream::BufferPool;
 use crate::tls_front::TlsFrontCache;
 use crate::transport::middle_proxy::MePoolMux;
-use crate::transport::socket::set_linger_zero;
+use crate::transport::socket::{set_linger_zero, set_tcp_quickack};
 use crate::transport::{
     ListenOptions, UpstreamManager, create_sharded_listeners, find_listener_processes,
 };
@@ -559,6 +559,14 @@ pub(crate) fn spawn_tcp_accept_loops(
                             if matches!(rst_mode, RstOnCloseMode::Errors | RstOnCloseMode::Always) {
                                 let _ = set_linger_zero(&stream);
                             }
+                            // TCP_QUICKACK: skip Linux's delayed-ACK on the
+                            // freshly-accepted client socket. MTProto's small
+                            // request-response patterns suffer up to ~40 ms
+                            // of artificial pause per delayed ACK; for a
+                            // client doing thousands of small message
+                            // exchanges this is measurable. Best-effort —
+                            // ignored on non-Linux, never blocks accept.
+                            let _ = set_tcp_quickack(&stream);
                             if !*admission_rx_tcp.borrow() {
                                 debug!(peer = %peer_addr, "Admission gate closed, dropping connection");
                                 drop(stream);
