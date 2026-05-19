@@ -25,7 +25,7 @@ use crate::proxy::route_mode::RouteRuntimeController;
 use crate::startup::StartupTracker;
 use crate::stats::Stats;
 use crate::transport::UpstreamManager;
-use crate::transport::middle_proxy::MePool;
+use crate::transport::middle_proxy::MePoolMux;
 
 mod config_store;
 mod events;
@@ -85,7 +85,7 @@ pub(super) struct ApiRuntimeState {
 pub(super) struct ApiShared {
     pub(super) stats: Arc<Stats>,
     pub(super) ip_tracker: Arc<UserIpTracker>,
-    pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
+    pub(super) me_pool: Arc<RwLock<Option<Arc<MePoolMux>>>>,
     pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
     pub(super) quota_state_path: PathBuf,
@@ -127,7 +127,7 @@ pub async fn serve(
     listen: SocketAddr,
     stats: Arc<Stats>,
     ip_tracker: Arc<UserIpTracker>,
-    me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
+    me_pool: Arc<RwLock<Option<Arc<MePoolMux>>>>,
     route_runtime: Arc<RouteRuntimeController>,
     upstream_manager: Arc<UpstreamManager>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,

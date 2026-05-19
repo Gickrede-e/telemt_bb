@@ -23,7 +23,7 @@ use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{ReplayChecker, Stats};
 use crate::tls_front::TlsFrontCache;
 use crate::transport::UpstreamManager;
-use crate::transport::middle_proxy::{MePool, MeReinitTrigger};
+use crate::transport::middle_proxy::{MePoolMux, MeReinitTrigger};
 
 use super::helpers::write_beobachten_snapshot;
 
@@ -46,12 +46,12 @@ pub(crate) async fn spawn_runtime_tasks(
     stats: Arc<Stats>,
     upstream_manager: Arc<UpstreamManager>,
     replay_checker: Arc<ReplayChecker>,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     rng: Arc<SecureRandom>,
     ip_tracker: Arc<UserIpTracker>,
     beobachten: Arc<BeobachtenStore>,
     api_config_tx: watch::Sender<Arc<ProxyConfig>>,
-    me_pool_for_policy: Option<Arc<MePool>>,
+    me_pool_for_policy: Option<Arc<MePoolMux>>,
     shared_state: Arc<ProxySharedState>,
     me_ready_tx: watch::Sender<u64>,
 ) -> RuntimeWatches {
@@ -133,16 +133,20 @@ pub(crate) async fn spawn_runtime_tasks(
             let cfg = config_rx_policy.borrow_and_update().clone();
             stats_policy
                 .apply_telemetry_policy(TelemetryPolicy::from_config(&cfg.general.telemetry));
-            if let Some(pool) = &me_pool_for_policy {
-                pool.update_runtime_transport_policy(
-                    cfg.general.me_socks_kdf_policy,
-                    cfg.general.me_route_backpressure_enabled,
-                    cfg.general.me_route_fairshare_enabled,
-                    cfg.general.me_route_backpressure_base_timeout_ms,
-                    cfg.general.me_route_backpressure_high_timeout_ms,
-                    cfg.general.me_route_backpressure_high_watermark_pct,
-                    cfg.general.me_reader_route_data_wait_ms,
-                );
+            if let Some(mux) = &me_pool_for_policy {
+                // Transport policy applies identically to every shard —
+                // fan out so all shards reflect the live config.
+                for pool in mux.shards() {
+                    pool.update_runtime_transport_policy(
+                        cfg.general.me_socks_kdf_policy,
+                        cfg.general.me_route_backpressure_enabled,
+                        cfg.general.me_route_fairshare_enabled,
+                        cfg.general.me_route_backpressure_base_timeout_ms,
+                        cfg.general.me_route_backpressure_high_timeout_ms,
+                        cfg.general.me_route_backpressure_high_watermark_pct,
+                        cfg.general.me_reader_route_data_wait_ms,
+                    );
+                }
             }
         }
     });
@@ -256,46 +260,81 @@ pub(crate) async fn spawn_runtime_tasks(
         }
     });
 
-    if let Some(pool) = me_pool {
+    if let Some(mux) = me_pool {
         let reinit_trigger_capacity = config.general.me_reinit_trigger_channel.max(1);
-        let (reinit_tx, reinit_rx) = mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
 
-        let pool_clone_sched = pool.clone();
-        let rng_clone_sched = rng.clone();
-        let config_rx_clone_sched = config_rx.clone();
-        let me_ready_tx_sched = me_ready_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_reinit_scheduler(
-                pool_clone_sched,
-                rng_clone_sched,
-                config_rx_clone_sched,
-                reinit_rx,
-                me_ready_tx_sched,
-            )
-            .await;
-        });
+        // Per-shard reinit scheduler + config updater. Each shard runs its
+        // own reinit lifecycle (its writers, its generation, its hash) so
+        // the channels must be 1:1 with shards — a single channel would
+        // require fan-out logic that wouldn't know which shard to target.
+        // The rotation task is config-driven (no pool refs), so one
+        // instance is shared across all shards' reinit triggers.
+        let mut all_reinit_txs: Vec<mpsc::Sender<MeReinitTrigger>> =
+            Vec::with_capacity(mux.shard_count());
+        for (shard_idx, pool) in mux.shards().iter().enumerate() {
+            let (reinit_tx, reinit_rx) = mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
 
-        let pool_clone = pool.clone();
-        let config_rx_clone = config_rx.clone();
-        let reinit_tx_updater = reinit_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_config_updater(
-                pool_clone,
-                config_rx_clone,
-                reinit_tx_updater,
-            )
-            .await;
-        });
+            let pool_clone_sched = pool.clone();
+            let rng_clone_sched = rng.clone();
+            let config_rx_clone_sched = config_rx.clone();
+            let me_ready_tx_sched = me_ready_tx.clone();
+            tokio::spawn(async move {
+                tracing::debug!(shard_idx, "Starting me_reinit_scheduler for shard");
+                crate::transport::middle_proxy::me_reinit_scheduler(
+                    pool_clone_sched,
+                    rng_clone_sched,
+                    config_rx_clone_sched,
+                    reinit_rx,
+                    me_ready_tx_sched,
+                )
+                .await;
+            });
 
+            let pool_clone = pool.clone();
+            let config_rx_clone = config_rx.clone();
+            let reinit_tx_updater = reinit_tx.clone();
+            tokio::spawn(async move {
+                crate::transport::middle_proxy::me_config_updater(
+                    pool_clone,
+                    config_rx_clone,
+                    reinit_tx_updater,
+                )
+                .await;
+            });
+
+            all_reinit_txs.push(reinit_tx);
+        }
+
+        // Rotation: one task drives rotation triggers for every shard.
+        // When the rotation timer fires it broadcasts to all shards so a
+        // rotation event is system-wide, not per-shard.
         let config_rx_clone_rot = config_rx.clone();
-        let reinit_tx_rotation = reinit_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_rotation_task(
-                config_rx_clone_rot,
-                reinit_tx_rotation,
-            )
-            .await;
-        });
+        if all_reinit_txs.len() == 1 {
+            let reinit_tx_rotation = all_reinit_txs.remove(0);
+            tokio::spawn(async move {
+                crate::transport::middle_proxy::me_rotation_task(
+                    config_rx_clone_rot,
+                    reinit_tx_rotation,
+                )
+                .await;
+            });
+        } else {
+            // Multi-shard rotation fan-out: spawn one rotation task per
+            // shard, each driving its own reinit channel. This keeps
+            // rotation atomic per shard without changing the
+            // me_rotation_task signature.
+            for (shard_idx, reinit_tx_rotation) in all_reinit_txs.into_iter().enumerate() {
+                let config_rx_clone_rot_shard = config_rx_clone_rot.clone();
+                tokio::spawn(async move {
+                    tracing::debug!(shard_idx, "Starting me_rotation_task for shard");
+                    crate::transport::middle_proxy::me_rotation_task(
+                        config_rx_clone_rot_shard,
+                        reinit_tx_rotation,
+                    )
+                    .await;
+                });
+            }
+        }
     }
 
     RuntimeWatches {

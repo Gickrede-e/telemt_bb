@@ -20,7 +20,7 @@ use crate::stats::beobachten::BeobachtenStore;
 use crate::stats::{ReplayChecker, Stats};
 use crate::stream::BufferPool;
 use crate::tls_front::TlsFrontCache;
-use crate::transport::middle_proxy::MePool;
+use crate::transport::middle_proxy::MePoolMux;
 use crate::transport::socket::set_linger_zero;
 use crate::transport::{
     ListenOptions, UpstreamManager, create_sharded_listeners, find_listener_processes,
@@ -64,7 +64,7 @@ pub(crate) async fn bind_listeners(
     replay_checker: Arc<ReplayChecker>,
     buffer_pool: Arc<BufferPool>,
     rng: Arc<SecureRandom>,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     route_runtime: Arc<RouteRuntimeController>,
     tls_cache: Option<Arc<TlsFrontCache>>,
     ip_tracker: Arc<UserIpTracker>,
@@ -311,7 +311,12 @@ pub(crate) async fn bind_listeners(
                         let replay_checker = replay_checker.clone();
                         let buffer_pool = buffer_pool.clone();
                         let rng = rng.clone();
-                        let me_pool = me_pool.clone();
+                        // Unix sockets carry no peer IP, so we use the
+                        // synthetic fake_peer for shard hashing. All unix
+                        // clients spread evenly across shards.
+                        let me_pool = me_pool
+                            .as_ref()
+                            .map(|mux| mux.shard_for_peer(fake_peer.ip()).clone());
                         let route_runtime = route_runtime.clone();
                         let tls_cache = tls_cache.clone();
                         let ip_tracker = ip_tracker.clone();
@@ -435,7 +440,7 @@ struct AcceptContext {
     replay_checker: Arc<ReplayChecker>,
     buffer_pool: Arc<BufferPool>,
     rng: Arc<SecureRandom>,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     route_runtime: Arc<RouteRuntimeController>,
     tls_cache: Option<Arc<TlsFrontCache>>,
     ip_tracker: Arc<UserIpTracker>,
@@ -489,7 +494,7 @@ pub(crate) fn spawn_tcp_accept_loops(
     replay_checker: Arc<ReplayChecker>,
     buffer_pool: Arc<BufferPool>,
     rng: Arc<SecureRandom>,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     route_runtime: Arc<RouteRuntimeController>,
     tls_cache: Option<Arc<TlsFrontCache>>,
     ip_tracker: Arc<UserIpTracker>,
@@ -603,6 +608,15 @@ pub(crate) fn spawn_tcp_accept_loops(
 
                             tokio::spawn(async move {
                                 let _permit = permit;
+                                // Per-peer shard resolution: hash the client's
+                                // IP into one of the mux's shards (sticky-by-
+                                // peer) so every writer this session uses comes
+                                // from the same source IP. Single-shard
+                                // deployments collapse to mux.primary().
+                                let me_pool = ctx
+                                    .me_pool
+                                    .as_ref()
+                                    .map(|mux| mux.shard_for_peer(peer_addr.ip()).clone());
                                 if let Err(e) = ClientHandler::new_with_shared(
                                     stream,
                                     peer_addr,
@@ -612,7 +626,7 @@ pub(crate) fn spawn_tcp_accept_loops(
                                     ctx.replay_checker.clone(),
                                     ctx.buffer_pool.clone(),
                                     ctx.rng.clone(),
-                                    ctx.me_pool.clone(),
+                                    me_pool,
                                     ctx.route_runtime.clone(),
                                     ctx.tls_cache.clone(),
                                     ctx.ip_tracker.clone(),

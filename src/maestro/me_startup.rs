@@ -1,12 +1,13 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{RwLock, watch};
 use tracing::{error, info, warn};
 
-use crate::config::ProxyConfig;
+use crate::config::{MeWriterBindMode, ProxyConfig};
 use crate::crypto::SecureRandom;
 use crate::network::probe::{NetworkDecision, NetworkProbe};
 use crate::startup::{
@@ -15,7 +16,7 @@ use crate::startup::{
 };
 use crate::stats::Stats;
 use crate::transport::UpstreamManager;
-use crate::transport::middle_proxy::MePool;
+use crate::transport::middle_proxy::{MePool, MePoolMux};
 
 use super::helpers::load_startup_proxy_config_snapshot;
 
@@ -28,9 +29,9 @@ pub(crate) async fn initialize_me_pool(
     upstream_manager: Arc<UpstreamManager>,
     rng: Arc<SecureRandom>,
     stats: Arc<Stats>,
-    api_me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
+    api_me_pool: Arc<RwLock<Option<Arc<MePoolMux>>>>,
     me_ready_tx: watch::Sender<u64>,
-) -> Option<Arc<MePool>> {
+) -> Option<Arc<MePoolMux>> {
     if !use_middle_proxy {
         return None;
     }
@@ -201,9 +202,19 @@ pub(crate) async fn initialize_me_pool(
                 startup_tracker
                     .set_me_status(StartupMeStatus::Initializing, COMPONENT_ME_POOL_CONSTRUCT)
                     .await;
+
+                // Per-source-IP shard plan. When `me_writer_bind_mode = shard`
+                // and the operator configured ≥2 `bind_addresses`, we build
+                // one fully-isolated MePool per address (each pool's writers
+                // pin to its single source IP via shard_bind_override). The
+                // primary shard (index 0) uses the existing inline init path
+                // below; supplementary shards (1..N) get their own background
+                // init+supervisor via spawn_shard_supervisor.
+                let shard_overrides = compute_shard_overrides(config);
+                let shard_count = shard_overrides.len();
                 let pool = MePool::new(
                     proxy_tag.clone(),
-                    proxy_secret,
+                    proxy_secret.clone(),
                     config.general.middle_proxy_nat_ip,
                     me_nat_probe,
                     None,
@@ -294,19 +305,150 @@ pub(crate) async fn initialize_me_pool(
                     config.general.me_route_blocking_send_timeout_ms,
                     config.general.me_route_inline_recovery_attempts,
                     config.general.me_route_inline_recovery_wait_ms,
-                    // shard_bind_override: legacy single-pool path leaves it unset
-                    // so UpstreamManager handles bind selection as before. The
-                    // mux path (`me_writer_bind_mode = "shard"`) constructs
-                    // each shard with its own pinned IP.
-                    None,
+                    shard_overrides[0],
                 );
+
+                // Build supplementary shards (1..N) when sharding is active.
+                // Each MePool::new is cheap (just allocates state); their
+                // outbound MTProto handshakes happen later in the per-shard
+                // supervisor spawned below. Construction must complete before
+                // the mux is built so listeners see all N shards on their
+                // very first accept.
+                let mut shards: Vec<Arc<MePool>> = Vec::with_capacity(shard_count);
+                shards.push(pool.clone());
+                for &override_bind in shard_overrides.iter().skip(1) {
+                    shards.push(MePool::new(
+                        proxy_tag.clone(),
+                        proxy_secret.clone(),
+                        config.general.middle_proxy_nat_ip,
+                        me_nat_probe,
+                        None,
+                        config.network.stun_servers.clone(),
+                        config.general.stun_nat_probe_concurrency,
+                        probe.detected_ipv6,
+                        config.timeouts.me_one_retry,
+                        config.timeouts.me_one_timeout_ms,
+                        cfg_v4.map.clone(),
+                        cfg_v6.map.clone(),
+                        cfg_v4.default_dc.or(cfg_v6.default_dc),
+                        decision.clone(),
+                        Some(upstream_manager.clone()),
+                        rng.clone(),
+                        stats.clone(),
+                        config.general.me_keepalive_enabled,
+                        config.general.me_keepalive_interval_secs,
+                        config.general.me_keepalive_jitter_secs,
+                        config.general.me_keepalive_payload_random,
+                        config.general.rpc_proxy_req_every,
+                        config.general.me_warmup_stagger_enabled,
+                        config.general.me_warmup_step_delay_ms,
+                        config.general.me_warmup_step_jitter_ms,
+                        config.general.me_reconnect_max_concurrent_per_dc,
+                        config.general.me_reconnect_backoff_base_ms,
+                        config.general.me_reconnect_backoff_cap_ms,
+                        config.general.me_reconnect_fast_retry_count,
+                        config.general.me_single_endpoint_shadow_writers,
+                        config.general.me_single_endpoint_outage_mode_enabled,
+                        config.general.me_single_endpoint_outage_disable_quarantine,
+                        config.general.me_single_endpoint_outage_backoff_min_ms,
+                        config.general.me_single_endpoint_outage_backoff_max_ms,
+                        config.general.me_single_endpoint_shadow_rotate_every_secs,
+                        config.general.me_floor_mode,
+                        config.general.me_adaptive_floor_idle_secs,
+                        config.general.me_adaptive_floor_min_writers_single_endpoint,
+                        config.general.me_adaptive_floor_min_writers_multi_endpoint,
+                        config.general.me_writer_bind_multiplier,
+                        config.general.me_adaptive_floor_recover_grace_secs,
+                        config.general.me_adaptive_floor_writers_per_core_total,
+                        config.general.me_adaptive_floor_cpu_cores_override,
+                        config
+                            .general
+                            .me_adaptive_floor_max_extra_writers_single_per_core,
+                        config
+                            .general
+                            .me_adaptive_floor_max_extra_writers_multi_per_core,
+                        config.general.me_adaptive_floor_max_active_writers_per_core,
+                        config.general.me_adaptive_floor_max_warm_writers_per_core,
+                        config.general.me_adaptive_floor_max_active_writers_global,
+                        config.general.me_adaptive_floor_max_warm_writers_global,
+                        config.general.hardswap,
+                        config.general.me_pool_drain_ttl_secs,
+                        config.general.me_instadrain,
+                        config.general.me_pool_drain_threshold,
+                        config.general.me_pool_drain_soft_evict_enabled,
+                        config.general.me_pool_drain_soft_evict_grace_secs,
+                        config.general.me_pool_drain_soft_evict_per_writer,
+                        config.general.me_pool_drain_soft_evict_budget_per_core,
+                        config.general.me_pool_drain_soft_evict_cooldown_ms,
+                        config.general.effective_me_pool_force_close_secs(),
+                        config.general.me_pool_min_fresh_ratio,
+                        config.general.me_hardswap_warmup_delay_min_ms,
+                        config.general.me_hardswap_warmup_delay_max_ms,
+                        config.general.me_hardswap_warmup_extra_passes,
+                        config.general.me_hardswap_warmup_pass_backoff_base_ms,
+                        config.general.me_bind_stale_mode,
+                        config.general.me_bind_stale_ttl_secs,
+                        config.general.me_secret_atomic_snapshot,
+                        config.general.me_deterministic_writer_sort,
+                        config.general.me_writer_pick_mode,
+                        config.general.me_writer_pick_sample_size,
+                        config.general.me_socks_kdf_policy,
+                        config.general.me_writer_cmd_channel_capacity,
+                        config.general.me_route_channel_capacity,
+                        config.general.me_route_backpressure_enabled,
+                        config.general.me_route_fairshare_enabled,
+                        config.general.me_route_backpressure_base_timeout_ms,
+                        config.general.me_route_backpressure_high_timeout_ms,
+                        config.general.me_route_backpressure_high_watermark_pct,
+                        config.general.me_reader_route_data_wait_ms,
+                        config.general.me_health_interval_ms_unhealthy,
+                        config.general.me_health_interval_ms_healthy,
+                        config.general.me_warn_rate_limit_ms,
+                        config.general.me_route_no_writer_mode,
+                        config.general.me_route_no_writer_wait_ms,
+                        config.general.me_route_hybrid_max_wait_ms,
+                        config.general.me_route_blocking_send_timeout_ms,
+                        config.general.me_route_inline_recovery_attempts,
+                        config.general.me_route_inline_recovery_wait_ms,
+                        override_bind,
+                    ));
+                }
+
                 startup_tracker
                     .complete_component(
                         COMPONENT_ME_POOL_CONSTRUCT,
-                        Some("ME pool object created".to_string()),
+                        Some(format!("ME pool object created ({} shards)", shard_count)),
                     )
                     .await;
-                *api_me_pool.write().await = Some(pool.clone());
+
+                // Build the mux holding all shards. When shard_count == 1
+                // we still wrap in `from_single` so the api_me_pool storage
+                // type is uniform; the wrapper is a 1-element vec and a
+                // zero-cost passthrough at the call sites.
+                let mux = if shard_count == 1 {
+                    Arc::new(MePoolMux::from_single(pool.clone()))
+                } else {
+                    Arc::new(MePoolMux::from_shards(
+                        shards.clone(),
+                        shard_overrides.clone(),
+                    ))
+                };
+                *api_me_pool.write().await = Some(mux.clone());
+
+                // Kick off supplementary shards' init+supervisor in their own
+                // background runtimes. They run in parallel with the primary
+                // shard's init (below) so the slowest shard, not the sum,
+                // sets ME readiness latency.
+                for (idx, shard) in shards.iter().enumerate().skip(1) {
+                    spawn_shard_supervisor(
+                        shard.clone(),
+                        idx,
+                        rng.clone(),
+                        pool_size,
+                        me_init_retry_attempts,
+                        me_ready_tx.clone(),
+                    );
+                }
                 startup_tracker
                     .start_component(
                         COMPONENT_ME_POOL_INIT_STAGE1,
@@ -467,7 +609,7 @@ pub(crate) async fn initialize_me_pool(
                         startup_grace_secs = 80,
                         "ME pool initialization continues in background; startup continues with conditional Direct fallback"
                     );
-                    Some(pool)
+                    Some(mux)
                 } else {
                     let mut init_attempt: u32 = 0;
                     loop {
@@ -558,7 +700,7 @@ pub(crate) async fn initialize_me_pool(
                                     }
                                 });
 
-                                break Some(pool);
+                                break Some(mux);
                             }
                             Err(e) => {
                                 startup_tracker.set_me_last_error(Some(e.to_string())).await;
@@ -668,4 +810,326 @@ pub(crate) async fn initialize_me_pool(
             None
         }
     }
+}
+
+/// Derive the per-shard `bind_addresses` overrides from operator config.
+///
+/// Returns one entry per shard. A 1-element `[None]` vec represents the
+/// legacy single-pool deployment (or fallback when shard mode was
+/// requested but operator did not configure enough bind addresses).
+/// Otherwise returns N×`Some(IpAddr)`, one per parsed bind entry.
+///
+/// Validation happens here so the rest of the startup path can assume
+/// `shard_overrides.len() >= 1` is always satisfied.
+fn compute_shard_overrides(config: &ProxyConfig) -> Vec<Option<IpAddr>> {
+    compute_shard_overrides_inner(config.general.me_writer_bind_mode, &config.upstreams)
+}
+
+/// Pure inner — no `&ProxyConfig` so unit tests can drive it without
+/// constructing a full ProxyConfig (heavy and unrelated to the policy).
+fn compute_shard_overrides_inner(
+    mode: MeWriterBindMode,
+    upstreams: &[crate::config::UpstreamConfig],
+) -> Vec<Option<IpAddr>> {
+    if mode != MeWriterBindMode::Shard {
+        return vec![None];
+    }
+    // bind_addresses lives on the Direct variant of UpstreamType. SOCKS
+    // upstreams are out of scope for sharding — they bind through their
+    // proxy, so they don't expose a source-IP we can pin per-shard.
+    let bind_addrs: Vec<IpAddr> = upstreams
+        .iter()
+        .filter_map(|u| match &u.upstream_type {
+            crate::config::UpstreamType::Direct { bind_addresses, .. } => bind_addresses.as_ref(),
+            _ => None,
+        })
+        .flat_map(|v| v.iter().filter_map(|s| s.parse::<IpAddr>().ok()))
+        .collect();
+    if bind_addrs.len() < 2 {
+        warn!(
+            bind_addresses_count = bind_addrs.len(),
+            "me_writer_bind_mode=shard requires ≥2 bind_addresses; falling back to single pool"
+        );
+        return vec![None];
+    }
+    info!(
+        shards = bind_addrs.len(),
+        "Activating MePoolMux per-source-IP sharding"
+    );
+    bind_addrs.into_iter().map(Some).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the shard activation policy. These are pure-function
+    //! tests over `compute_shard_overrides_inner`; constructing real
+    //! `MePool` shards is exercised by integration tests in
+    //! `tests/middle_proxy_*` once they're added.
+    use super::*;
+    use crate::config::{UpstreamConfig, UpstreamType};
+
+    fn mk_direct(bind_addresses: Option<Vec<&str>>) -> UpstreamConfig {
+        UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: bind_addresses.map(|v| v.into_iter().map(String::from).collect()),
+                bindtodevice: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+            ipv4: None,
+            ipv6: None,
+        }
+    }
+
+    #[test]
+    fn round_robin_mode_yields_single_none_regardless_of_bind_count() {
+        // Default mode: always one shard, override is None so connect
+        // chain uses normal bind_addresses round-robin.
+        let upstreams = vec![mk_direct(Some(vec!["198.51.100.10", "198.51.100.11"]))];
+        let out = compute_shard_overrides_inner(MeWriterBindMode::RoundRobin, &upstreams);
+        assert_eq!(out, vec![None]);
+    }
+
+    #[test]
+    fn shard_mode_with_zero_bind_addresses_falls_back_to_single() {
+        // Operator opted into shard mode but didn't configure bind_addrs:
+        // we must NOT panic and must NOT spawn zero shards — fall back to
+        // single-pool behaviour so the proxy still runs.
+        let upstreams = vec![mk_direct(None)];
+        let out = compute_shard_overrides_inner(MeWriterBindMode::Shard, &upstreams);
+        assert_eq!(out, vec![None]);
+    }
+
+    #[test]
+    fn shard_mode_with_one_bind_address_falls_back_to_single() {
+        // 1 bind address provides nothing over the round-robin path —
+        // multiplier=1 already gives one writer per source IP. Sharding
+        // overhead (N pools, N supervisors) only earns its keep at N>=2.
+        let upstreams = vec![mk_direct(Some(vec!["198.51.100.10"]))];
+        let out = compute_shard_overrides_inner(MeWriterBindMode::Shard, &upstreams);
+        assert_eq!(out, vec![None]);
+    }
+
+    #[test]
+    fn shard_mode_with_two_or_more_yields_one_some_per_address() {
+        // Happy path: each bind address becomes a separate shard's
+        // override. Ordering preserves config order so operators can
+        // predict which shard hosts which source IP for debugging.
+        let upstreams = vec![mk_direct(Some(vec![
+            "198.51.100.10",
+            "198.51.100.11",
+            "198.51.100.12",
+        ]))];
+        let out = compute_shard_overrides_inner(MeWriterBindMode::Shard, &upstreams);
+        assert_eq!(
+            out,
+            vec![
+                Some("198.51.100.10".parse::<IpAddr>().unwrap()),
+                Some("198.51.100.11".parse::<IpAddr>().unwrap()),
+                Some("198.51.100.12".parse::<IpAddr>().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_mode_unparseable_addresses_are_silently_dropped() {
+        // Malformed entries shouldn't crash startup; they get skipped
+        // and we operate on whatever parsed correctly. If the remaining
+        // count drops below 2, we fall back to single shard.
+        let upstreams = vec![mk_direct(Some(vec![
+            "not-an-ip",
+            "198.51.100.10",
+            "also.not.ip",
+            "198.51.100.11",
+        ]))];
+        let out = compute_shard_overrides_inner(MeWriterBindMode::Shard, &upstreams);
+        assert_eq!(
+            out,
+            vec![
+                Some("198.51.100.10".parse::<IpAddr>().unwrap()),
+                Some("198.51.100.11".parse::<IpAddr>().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_mode_socks_upstreams_contribute_no_shards() {
+        // SOCKS upstreams have no source-IP to pin (they bind via the
+        // SOCKS server's interface). Mixing SOCKS + Direct: only Direct
+        // entries' bind_addresses count toward shard count.
+        let upstreams = vec![
+            UpstreamConfig {
+                upstream_type: UpstreamType::Socks5 {
+                    address: "127.0.0.1:1080".to_string(),
+                    interface: None,
+                    username: None,
+                    password: None,
+                },
+                weight: 1,
+                enabled: true,
+                scopes: String::new(),
+                selected_scope: String::new(),
+                ipv4: None,
+                ipv6: None,
+            },
+            mk_direct(Some(vec!["198.51.100.10", "198.51.100.11"])),
+        ];
+        let out = compute_shard_overrides_inner(MeWriterBindMode::Shard, &upstreams);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], Some("198.51.100.10".parse::<IpAddr>().unwrap()));
+        assert_eq!(out[1], Some("198.51.100.11".parse::<IpAddr>().unwrap()));
+    }
+}
+
+/// Run the per-shard init retry loop + spawn the supervised background
+/// tasks (health monitor / drain timeout enforcer / zombie watchdog).
+///
+/// Unlike the primary shard's inline init code in `initialize_me_pool`,
+/// this helper does NOT touch `StartupTracker` — that surface tracks
+/// startup of the proxy as a whole, which is gated only on shard 0. The
+/// additional shards init in their own background runtimes so that their
+/// (potentially slower) MTProto handshakes don't block primary readiness.
+fn spawn_shard_supervisor(
+    pool: Arc<MePool>,
+    shard_idx: usize,
+    rng: Arc<SecureRandom>,
+    pool_size: usize,
+    me_init_retry_attempts: u32,
+    me_ready_tx: watch::Sender<u64>,
+) {
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                error!(
+                    error = %error,
+                    shard_idx = shard_idx,
+                    "Failed to build background runtime for shard init"
+                );
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let mut init_attempt: u32 = 0;
+            loop {
+                init_attempt = init_attempt.saturating_add(1);
+                match pool.init(pool_size, &rng).await {
+                    Ok(()) => {
+                        info!(
+                            shard_idx,
+                            attempt = init_attempt,
+                            "Additional MePool shard initialised successfully"
+                        );
+                        // Bump readiness watch so any /v1/* probe sees the
+                        // additional shard as alive. Primary shard owns the
+                        // initial readiness signal; this is supplementary.
+                        me_ready_tx.send_modify(|v| *v = v.saturating_add(1));
+
+                        // Supervised background tasks — one set per shard.
+                        // Each task restarts on panic via nested tokio::spawn
+                        // and JoinHandle inspection, matching the primary
+                        // shard's supervisor pattern.
+                        let health = pool.clone();
+                        let rng_h = rng.clone();
+                        let min_conns = pool_size;
+                        tokio::spawn(async move {
+                            loop {
+                                let p = health.clone();
+                                let r = rng_h.clone();
+                                let res = tokio::spawn(async move {
+                                    crate::transport::middle_proxy::me_health_monitor(
+                                        p, r, min_conns,
+                                    )
+                                    .await;
+                                })
+                                .await;
+                                match res {
+                                    Ok(()) => warn!(
+                                        shard_idx,
+                                        "me_health_monitor exited unexpectedly, restarting"
+                                    ),
+                                    Err(e) => {
+                                        error!(error = %e, shard_idx, "me_health_monitor panicked, restarting in 1s");
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                        });
+                        let drain = pool.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let p = drain.clone();
+                                let res = tokio::spawn(async move {
+                                    crate::transport::middle_proxy::me_drain_timeout_enforcer(p)
+                                        .await;
+                                })
+                                .await;
+                                match res {
+                                    Ok(()) => warn!(
+                                        shard_idx,
+                                        "me_drain_timeout_enforcer exited unexpectedly, restarting"
+                                    ),
+                                    Err(e) => {
+                                        error!(error = %e, shard_idx, "me_drain_timeout_enforcer panicked, restarting in 1s");
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                        });
+                        let watchdog = pool.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let p = watchdog.clone();
+                                let res = tokio::spawn(async move {
+                                    crate::transport::middle_proxy::me_zombie_writer_watchdog(p)
+                                        .await;
+                                })
+                                .await;
+                                match res {
+                                    Ok(()) => warn!(
+                                        shard_idx,
+                                        "me_zombie_writer_watchdog exited unexpectedly, restarting"
+                                    ),
+                                    Err(e) => {
+                                        error!(error = %e, shard_idx, "me_zombie_writer_watchdog panicked, restarting in 1s");
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                        });
+                        // Keep this background runtime alive — see comment
+                        // in primary init at me_startup.rs.
+                        std::future::pending::<()>().await;
+                        unreachable!();
+                    }
+                    Err(e) => {
+                        if me_init_retry_attempts > 0 && init_attempt >= me_init_retry_attempts {
+                            error!(
+                                shard_idx,
+                                error = %e,
+                                attempt = init_attempt,
+                                "shard MePool init retries exhausted; abandoning this shard"
+                            );
+                            break;
+                        }
+                        warn!(
+                            shard_idx,
+                            error = %e,
+                            attempt = init_attempt,
+                            retry_in_secs = 2,
+                            "Shard MePool init failed, retrying"
+                        );
+                        pool.reset_stun_state();
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        });
+    });
 }

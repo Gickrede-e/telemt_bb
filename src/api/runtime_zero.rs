@@ -207,7 +207,7 @@ pub(super) async fn build_runtime_gates_data(
             .read()
             .await
             .as_ref()
-            .map(|pool| pool.is_runtime_ready())
+            .map(|mux| mux.primary().is_runtime_ready())
             .unwrap_or(false)
     };
 
