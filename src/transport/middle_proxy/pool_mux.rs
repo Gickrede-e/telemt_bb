@@ -24,12 +24,16 @@
 //!
 //! Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B+.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use super::pool::MePool;
+use super::pool_status::{
+    MeApiDcEndpointWriterSnapshot, MeApiDcStatusSnapshot, MeApiQuarantinedEndpointSnapshot,
+    MeApiRuntimeSnapshot, MeApiStatusSnapshot,
+};
 
 /// Multiplexer over N per-source-IP `MePool` shards.
 ///
@@ -118,6 +122,399 @@ impl MePoolMux {
     pub fn primary(&self) -> &Arc<MePool> {
         &self.inner.shards[0]
     }
+
+    /// Aggregate `api_status_snapshot()` across every shard so /v1/stats
+    /// readers see the system-wide writer pool, not just shard 0.
+    ///
+    /// Aggregation rules (the ONLY interesting design surface in this fn):
+    ///   * **Counts that scale per-shard** (required_writers, alive_writers,
+    ///     fresh_alive_writers): SUM across shards. Each shard has its own
+    ///     writer pool; the system total is the sum.
+    ///   * **Counts that are config-derived and same across shards**
+    ///     (configured_dc_groups, configured_endpoints, available_endpoints):
+    ///     take from primary. All shards see the same Telegram proxy_config,
+    ///     so this is identical across shards.
+    ///   * **`available_pct`**: take from primary (config-derived).
+    ///   * **`coverage_pct`, `fresh_coverage_pct`**: RECOMPUTED from the
+    ///     summed numerator/denominator. A naïve average of per-shard
+    ///     ratios would weight a shard with 1 writer the same as a shard
+    ///     with 100 — wrong.
+    ///   * **`generated_at_epoch_secs`**: take the MAX. We want the freshest
+    ///     timestamp; a clock skew across shards would otherwise pick
+    ///     stale.
+    ///   * **`writers: Vec`**: concatenate. Caller (api/runtime_stats) sees
+    ///     N× more writers in shard mode; that's the correct view.
+    ///   * **`dcs: Vec`**: merge by `dc` key. For each DC, sum writer
+    ///     counts; merge endpoint sets (union); for endpoint_writers, sum
+    ///     per-endpoint writer counts across shards.
+    ///
+    /// Single-shard fast path: clone primary's snapshot directly so the
+    /// (default) round_robin mode pays zero overhead.
+    pub async fn aggregate_status_snapshot(&self) -> MeApiStatusSnapshot {
+        if self.inner.shards.len() == 1 {
+            return self.inner.shards[0].api_status_snapshot().await;
+        }
+        let mut snaps = Vec::with_capacity(self.inner.shards.len());
+        for shard in &self.inner.shards {
+            snaps.push(shard.api_status_snapshot().await);
+        }
+        merge_status_snapshots(snaps)
+    }
+
+    /// Aggregate `api_runtime_snapshot()` across every shard.
+    ///
+    /// Aggregation rules:
+    ///   * **Config-derived fields** (intervals, thresholds, floor params,
+    ///     keepalive, etc.): take from primary. They're identical across
+    ///     shards because operator config is global.
+    ///   * **`active_generation`, `warm_generation`,
+    ///     `pending_hardswap_generation`**: take the MIN. A "system has
+    ///     rotated past generation N" claim is only true once every shard
+    ///     has reached N. Reporting the max would lie about laggards.
+    ///   * **`pending_hardswap_age_secs`**: take the MAX `Option`. Oldest
+    ///     pending hardswap is the most relevant operator signal — None
+    ///     if no shard has one pending.
+    ///   * **`adaptive_floor_active_writers_current`,
+    ///     `adaptive_floor_warm_writers_current`**: SUM across shards.
+    ///   * **`adaptive_floor_*_current` / `_effective` / `_target_writers_total`**:
+    ///     sum (writer-count-shaped) or primary (config-shaped). See
+    ///     comment per field.
+    ///   * **`quarantined_endpoints`**: union by endpoint addr. When the
+    ///     same endpoint is quarantined in K shards, the merged entry's
+    ///     `remaining_ms` is the MAX — operator reads it as "this endpoint
+    ///     stays quarantined for at least this long somewhere".
+    ///   * **`network_path`**: take from primary. DC routing path is
+    ///     config + network-decision-derived, identical across shards.
+    pub async fn aggregate_runtime_snapshot(&self) -> MeApiRuntimeSnapshot {
+        if self.inner.shards.len() == 1 {
+            return self.inner.shards[0].api_runtime_snapshot().await;
+        }
+        let mut snaps = Vec::with_capacity(self.inner.shards.len());
+        for shard in &self.inner.shards {
+            snaps.push(shard.api_runtime_snapshot().await);
+        }
+        merge_runtime_snapshots(snaps)
+    }
+}
+
+/// Status snapshot merge — extracted so it's pure-function-testable
+/// without spinning up real `MePool` instances.
+pub(crate) fn merge_status_snapshots(snaps: Vec<MeApiStatusSnapshot>) -> MeApiStatusSnapshot {
+    debug_assert!(
+        !snaps.is_empty(),
+        "merge_status_snapshots requires ≥1 snapshot"
+    );
+    // Anchor most config-shaped fields on the primary (snaps[0]) but sum
+    // writer-count fields and recompute coverages from the totals.
+    let generated_at_epoch_secs = snaps
+        .iter()
+        .map(|s| s.generated_at_epoch_secs)
+        .max()
+        .unwrap_or_default();
+    let configured_dc_groups = snaps[0].configured_dc_groups;
+    let configured_endpoints = snaps[0].configured_endpoints;
+    let available_endpoints = snaps[0].available_endpoints;
+    let available_pct = snaps[0].available_pct;
+    let required_writers: usize = snaps.iter().map(|s| s.required_writers).sum();
+    let alive_writers: usize = snaps.iter().map(|s| s.alive_writers).sum();
+    let fresh_alive_writers: usize = snaps.iter().map(|s| s.fresh_alive_writers).sum();
+    let coverage_pct = pct_or_zero(alive_writers, required_writers);
+    let fresh_coverage_pct = pct_or_zero(fresh_alive_writers, required_writers);
+
+    let mut writers = Vec::new();
+    let mut dc_acc: BTreeMap<i16, DcAccumulator> = BTreeMap::new();
+    for snap in snaps {
+        writers.extend(snap.writers);
+        for dc in snap.dcs {
+            dc_acc
+                .entry(dc.dc)
+                .or_insert_with(DcAccumulator::new)
+                .absorb(dc);
+        }
+    }
+    let dcs = dc_acc.into_values().map(DcAccumulator::finalize).collect();
+
+    MeApiStatusSnapshot {
+        generated_at_epoch_secs,
+        configured_dc_groups,
+        configured_endpoints,
+        available_endpoints,
+        available_pct,
+        required_writers,
+        alive_writers,
+        coverage_pct,
+        fresh_alive_writers,
+        fresh_coverage_pct,
+        writers,
+        dcs,
+    }
+}
+
+/// Runtime snapshot merge — see docstring on
+/// `MePoolMux::aggregate_runtime_snapshot` for the rules.
+pub(crate) fn merge_runtime_snapshots(snaps: Vec<MeApiRuntimeSnapshot>) -> MeApiRuntimeSnapshot {
+    debug_assert!(
+        !snaps.is_empty(),
+        "merge_runtime_snapshots requires ≥1 snapshot"
+    );
+
+    // Generation invariants: "system rotated past N" means every shard ≥ N.
+    let active_generation = snaps.iter().map(|s| s.active_generation).min().unwrap_or(0);
+    let warm_generation = snaps.iter().map(|s| s.warm_generation).min().unwrap_or(0);
+    let pending_hardswap_generation = snaps
+        .iter()
+        .map(|s| s.pending_hardswap_generation)
+        .min()
+        .unwrap_or(0);
+    // Max of pending-ages so operators see the worst laggard. None when no
+    // shard has a pending hardswap.
+    let pending_hardswap_age_secs = snaps
+        .iter()
+        .filter_map(|s| s.pending_hardswap_age_secs)
+        .max();
+
+    // Writer-count totals (sum)
+    let adaptive_floor_active_writers_current: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_active_writers_current)
+        .sum();
+    let adaptive_floor_warm_writers_current: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_warm_writers_current)
+        .sum();
+    let adaptive_floor_target_writers_total: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_target_writers_total)
+        .sum();
+    let adaptive_floor_global_cap_raw: u64 =
+        snaps.iter().map(|s| s.adaptive_floor_global_cap_raw).sum();
+    let adaptive_floor_global_cap_effective: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_global_cap_effective)
+        .sum();
+    let adaptive_floor_active_cap_configured: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_active_cap_configured)
+        .sum();
+    let adaptive_floor_active_cap_effective: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_active_cap_effective)
+        .sum();
+    let adaptive_floor_warm_cap_configured: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_warm_cap_configured)
+        .sum();
+    let adaptive_floor_warm_cap_effective: u64 = snaps
+        .iter()
+        .map(|s| s.adaptive_floor_warm_cap_effective)
+        .sum();
+
+    // Quarantine union: by endpoint, max(remaining_ms).
+    let mut q_acc: HashMap<SocketAddr, u64> = HashMap::new();
+    for snap in &snaps {
+        for q in &snap.quarantined_endpoints {
+            q_acc
+                .entry(q.endpoint)
+                .and_modify(|v| *v = (*v).max(q.remaining_ms))
+                .or_insert(q.remaining_ms);
+        }
+    }
+    let mut quarantined_endpoints: Vec<MeApiQuarantinedEndpointSnapshot> = q_acc
+        .into_iter()
+        .map(
+            |(endpoint, remaining_ms)| MeApiQuarantinedEndpointSnapshot {
+                endpoint,
+                remaining_ms,
+            },
+        )
+        .collect();
+    quarantined_endpoints.sort_by_key(|q| (q.endpoint, q.remaining_ms));
+
+    // Everything else: take from primary (config-derived; identical across shards).
+    let primary = &snaps[0];
+    MeApiRuntimeSnapshot {
+        active_generation,
+        warm_generation,
+        pending_hardswap_generation,
+        pending_hardswap_age_secs,
+        hardswap_enabled: primary.hardswap_enabled,
+        floor_mode: primary.floor_mode,
+        adaptive_floor_idle_secs: primary.adaptive_floor_idle_secs,
+        adaptive_floor_min_writers_single_endpoint: primary
+            .adaptive_floor_min_writers_single_endpoint,
+        adaptive_floor_min_writers_multi_endpoint: primary
+            .adaptive_floor_min_writers_multi_endpoint,
+        adaptive_floor_recover_grace_secs: primary.adaptive_floor_recover_grace_secs,
+        adaptive_floor_writers_per_core_total: primary.adaptive_floor_writers_per_core_total,
+        adaptive_floor_cpu_cores_override: primary.adaptive_floor_cpu_cores_override,
+        adaptive_floor_max_extra_writers_single_per_core: primary
+            .adaptive_floor_max_extra_writers_single_per_core,
+        adaptive_floor_max_extra_writers_multi_per_core: primary
+            .adaptive_floor_max_extra_writers_multi_per_core,
+        adaptive_floor_max_active_writers_per_core: primary
+            .adaptive_floor_max_active_writers_per_core,
+        adaptive_floor_max_warm_writers_per_core: primary.adaptive_floor_max_warm_writers_per_core,
+        adaptive_floor_max_active_writers_global: primary.adaptive_floor_max_active_writers_global,
+        adaptive_floor_max_warm_writers_global: primary.adaptive_floor_max_warm_writers_global,
+        adaptive_floor_cpu_cores_detected: primary.adaptive_floor_cpu_cores_detected,
+        adaptive_floor_cpu_cores_effective: primary.adaptive_floor_cpu_cores_effective,
+        adaptive_floor_global_cap_raw,
+        adaptive_floor_global_cap_effective,
+        adaptive_floor_target_writers_total,
+        adaptive_floor_active_cap_configured,
+        adaptive_floor_active_cap_effective,
+        adaptive_floor_warm_cap_configured,
+        adaptive_floor_warm_cap_effective,
+        adaptive_floor_active_writers_current,
+        adaptive_floor_warm_writers_current,
+        me_keepalive_enabled: primary.me_keepalive_enabled,
+        me_keepalive_interval_secs: primary.me_keepalive_interval_secs,
+        me_keepalive_jitter_secs: primary.me_keepalive_jitter_secs,
+        me_keepalive_payload_random: primary.me_keepalive_payload_random,
+        rpc_proxy_req_every_secs: primary.rpc_proxy_req_every_secs,
+        me_reconnect_max_concurrent_per_dc: primary.me_reconnect_max_concurrent_per_dc,
+        me_reconnect_backoff_base_ms: primary.me_reconnect_backoff_base_ms,
+        me_reconnect_backoff_cap_ms: primary.me_reconnect_backoff_cap_ms,
+        me_reconnect_fast_retry_count: primary.me_reconnect_fast_retry_count,
+        me_pool_drain_ttl_secs: primary.me_pool_drain_ttl_secs,
+        me_pool_force_close_secs: primary.me_pool_force_close_secs,
+        me_pool_min_fresh_ratio: primary.me_pool_min_fresh_ratio,
+        me_bind_stale_mode: primary.me_bind_stale_mode,
+        me_bind_stale_ttl_secs: primary.me_bind_stale_ttl_secs,
+        me_single_endpoint_shadow_writers: primary.me_single_endpoint_shadow_writers,
+        me_single_endpoint_outage_mode_enabled: primary.me_single_endpoint_outage_mode_enabled,
+        me_single_endpoint_outage_disable_quarantine: primary
+            .me_single_endpoint_outage_disable_quarantine,
+        me_single_endpoint_outage_backoff_min_ms: primary.me_single_endpoint_outage_backoff_min_ms,
+        me_single_endpoint_outage_backoff_max_ms: primary.me_single_endpoint_outage_backoff_max_ms,
+        me_single_endpoint_shadow_rotate_every_secs: primary
+            .me_single_endpoint_shadow_rotate_every_secs,
+        me_deterministic_writer_sort: primary.me_deterministic_writer_sort,
+        me_writer_pick_mode: primary.me_writer_pick_mode,
+        me_writer_pick_sample_size: primary.me_writer_pick_sample_size,
+        me_socks_kdf_policy: primary.me_socks_kdf_policy,
+        quarantined_endpoints,
+        network_path: primary.network_path.clone(),
+    }
+}
+
+/// Per-DC accumulator: for each DC seen across shards, sum the writer
+/// counts and merge endpoint lists. Kept as a struct (not closure) so
+/// the merge can grow new fields without restructuring.
+struct DcAccumulator {
+    dc: i16,
+    endpoints: std::collections::BTreeSet<SocketAddr>,
+    endpoint_writers: HashMap<SocketAddr, usize>,
+    available_endpoints: usize,
+    required_writers: usize,
+    floor_min: usize,
+    floor_target: usize,
+    floor_max: usize,
+    floor_capped: bool,
+    alive_writers: usize,
+    fresh_alive_writers: usize,
+    load: usize,
+    rtt_ms_min: Option<f64>,
+    available_pct_primary: f64,
+    seen: usize,
+}
+
+impl DcAccumulator {
+    fn new() -> Self {
+        Self {
+            dc: 0,
+            endpoints: Default::default(),
+            endpoint_writers: HashMap::new(),
+            available_endpoints: 0,
+            required_writers: 0,
+            floor_min: 0,
+            floor_target: 0,
+            floor_max: 0,
+            floor_capped: false,
+            alive_writers: 0,
+            fresh_alive_writers: 0,
+            load: 0,
+            rtt_ms_min: None,
+            available_pct_primary: 0.0,
+            seen: 0,
+        }
+    }
+
+    fn absorb(&mut self, snap: MeApiDcStatusSnapshot) {
+        if self.seen == 0 {
+            // Anchor identity + config-shaped fields on the first shard
+            // contributing this DC. Subsequent shards see the SAME config
+            // (same proxy_config), so these stay consistent.
+            self.dc = snap.dc;
+            self.available_pct_primary = snap.available_pct;
+        }
+        self.seen += 1;
+        for ep in snap.endpoints {
+            self.endpoints.insert(ep);
+        }
+        for ew in snap.endpoint_writers {
+            *self.endpoint_writers.entry(ew.endpoint).or_insert(0) += ew.active_writers;
+        }
+        // Writer counts sum.
+        self.available_endpoints = self.available_endpoints.max(snap.available_endpoints);
+        self.required_writers += snap.required_writers;
+        self.floor_min += snap.floor_min;
+        self.floor_target += snap.floor_target;
+        self.floor_max += snap.floor_max;
+        self.floor_capped = self.floor_capped || snap.floor_capped;
+        self.alive_writers += snap.alive_writers;
+        self.fresh_alive_writers += snap.fresh_alive_writers;
+        self.load += snap.load;
+        // RTT: take the minimum across shards — the best path is what the
+        // operator's smallest-latency shard observed.
+        if let Some(r) = snap.rtt_ms {
+            self.rtt_ms_min = Some(match self.rtt_ms_min {
+                Some(prev) => prev.min(r),
+                None => r,
+            });
+        }
+    }
+
+    fn finalize(self) -> MeApiDcStatusSnapshot {
+        let endpoints: Vec<SocketAddr> = self.endpoints.into_iter().collect();
+        let mut endpoint_writers: Vec<MeApiDcEndpointWriterSnapshot> = self
+            .endpoint_writers
+            .into_iter()
+            .map(|(endpoint, active_writers)| MeApiDcEndpointWriterSnapshot {
+                endpoint,
+                active_writers,
+            })
+            .collect();
+        endpoint_writers.sort_by_key(|e| e.endpoint);
+        MeApiDcStatusSnapshot {
+            dc: self.dc,
+            endpoints,
+            endpoint_writers,
+            available_endpoints: self.available_endpoints,
+            available_pct: self.available_pct_primary,
+            required_writers: self.required_writers,
+            floor_min: self.floor_min,
+            floor_target: self.floor_target,
+            floor_max: self.floor_max,
+            floor_capped: self.floor_capped,
+            alive_writers: self.alive_writers,
+            coverage_pct: pct_or_zero(self.alive_writers, self.required_writers),
+            fresh_alive_writers: self.fresh_alive_writers,
+            fresh_coverage_pct: pct_or_zero(self.fresh_alive_writers, self.required_writers),
+            rtt_ms: self.rtt_ms_min,
+            load: self.load,
+        }
+    }
+}
+
+/// `numerator/denominator * 100`, 0 when denominator is 0. Centralised so
+/// aggregate coverages match per-shard formulas exactly.
+fn pct_or_zero(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64) * 100.0 / (denominator as f64)
+    }
 }
 
 fn canonicalize_ip(ip: IpAddr) -> IpAddr {
@@ -205,5 +602,390 @@ mod tests {
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let v4_mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001));
         assert_eq!(shard_index_for(v4, n), shard_index_for(v4_mapped, n));
+    }
+}
+
+#[cfg(test)]
+mod aggregation_tests {
+    //! Pure-function tests for `merge_status_snapshots` and
+    //! `merge_runtime_snapshots`. The aggregation must satisfy three
+    //! invariants:
+    //!
+    //!   1. **Sum-counts are correct**: required/alive/fresh writer
+    //!      counts add across shards; if they don't, /v1/stats lies about
+    //!      capacity utilisation.
+    //!   2. **Recomputed ratios match formulas**: coverage_pct must be
+    //!      `alive_sum / required_sum * 100`, not `mean(per_shard_pct)`.
+    //!      Naïve averaging weights a 1-writer shard equally with a
+    //!      100-writer shard — wrong.
+    //!   3. **Generations take min, not max**: "system is past generation
+    //!      N" requires every shard ≥ N. Reporting max would lie about
+    //!      laggards mid-rotation.
+    //!
+    //! These tests build raw snapshot structs (no live MePool) so they
+    //! run in microseconds and can exhaustively cover edge cases.
+    use super::{
+        MeApiDcEndpointWriterSnapshot, MeApiDcStatusSnapshot, MeApiQuarantinedEndpointSnapshot,
+        MeApiRuntimeSnapshot, MeApiStatusSnapshot,
+    };
+    use super::{merge_runtime_snapshots, merge_status_snapshots};
+    use std::net::SocketAddr;
+
+    fn ep(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn empty_runtime() -> MeApiRuntimeSnapshot {
+        MeApiRuntimeSnapshot {
+            active_generation: 0,
+            warm_generation: 0,
+            pending_hardswap_generation: 0,
+            pending_hardswap_age_secs: None,
+            hardswap_enabled: false,
+            floor_mode: "adaptive",
+            adaptive_floor_idle_secs: 0,
+            adaptive_floor_min_writers_single_endpoint: 0,
+            adaptive_floor_min_writers_multi_endpoint: 0,
+            adaptive_floor_recover_grace_secs: 0,
+            adaptive_floor_writers_per_core_total: 0,
+            adaptive_floor_cpu_cores_override: 0,
+            adaptive_floor_max_extra_writers_single_per_core: 0,
+            adaptive_floor_max_extra_writers_multi_per_core: 0,
+            adaptive_floor_max_active_writers_per_core: 0,
+            adaptive_floor_max_warm_writers_per_core: 0,
+            adaptive_floor_max_active_writers_global: 0,
+            adaptive_floor_max_warm_writers_global: 0,
+            adaptive_floor_cpu_cores_detected: 0,
+            adaptive_floor_cpu_cores_effective: 0,
+            adaptive_floor_global_cap_raw: 0,
+            adaptive_floor_global_cap_effective: 0,
+            adaptive_floor_target_writers_total: 0,
+            adaptive_floor_active_cap_configured: 0,
+            adaptive_floor_active_cap_effective: 0,
+            adaptive_floor_warm_cap_configured: 0,
+            adaptive_floor_warm_cap_effective: 0,
+            adaptive_floor_active_writers_current: 0,
+            adaptive_floor_warm_writers_current: 0,
+            me_keepalive_enabled: false,
+            me_keepalive_interval_secs: 0,
+            me_keepalive_jitter_secs: 0,
+            me_keepalive_payload_random: false,
+            rpc_proxy_req_every_secs: 0,
+            me_reconnect_max_concurrent_per_dc: 0,
+            me_reconnect_backoff_base_ms: 0,
+            me_reconnect_backoff_cap_ms: 0,
+            me_reconnect_fast_retry_count: 0,
+            me_pool_drain_ttl_secs: 0,
+            me_pool_force_close_secs: 0,
+            me_pool_min_fresh_ratio: 0.0,
+            me_bind_stale_mode: "off",
+            me_bind_stale_ttl_secs: 0,
+            me_single_endpoint_shadow_writers: 0,
+            me_single_endpoint_outage_mode_enabled: false,
+            me_single_endpoint_outage_disable_quarantine: false,
+            me_single_endpoint_outage_backoff_min_ms: 0,
+            me_single_endpoint_outage_backoff_max_ms: 0,
+            me_single_endpoint_shadow_rotate_every_secs: 0,
+            me_deterministic_writer_sort: false,
+            me_writer_pick_mode: "random",
+            me_writer_pick_sample_size: 0,
+            me_socks_kdf_policy: "off",
+            quarantined_endpoints: vec![],
+            network_path: vec![],
+        }
+    }
+
+    fn dc_snap(
+        dc: i16,
+        required: usize,
+        alive: usize,
+        fresh: usize,
+        endpoints: Vec<SocketAddr>,
+        rtt_ms: Option<f64>,
+    ) -> MeApiDcStatusSnapshot {
+        let endpoint_writers = endpoints
+            .iter()
+            .map(|&e| MeApiDcEndpointWriterSnapshot {
+                endpoint: e,
+                active_writers: 1,
+            })
+            .collect();
+        MeApiDcStatusSnapshot {
+            dc,
+            endpoints,
+            endpoint_writers,
+            available_endpoints: 1,
+            available_pct: 100.0,
+            required_writers: required,
+            floor_min: 1,
+            floor_target: 1,
+            floor_max: 2,
+            floor_capped: false,
+            alive_writers: alive,
+            coverage_pct: 0.0, // recomputed by merge
+            fresh_alive_writers: fresh,
+            fresh_coverage_pct: 0.0,
+            rtt_ms,
+            load: 0,
+        }
+    }
+
+    fn status_snap(
+        generated: u64,
+        required: usize,
+        alive: usize,
+        fresh: usize,
+        dcs: Vec<MeApiDcStatusSnapshot>,
+    ) -> MeApiStatusSnapshot {
+        MeApiStatusSnapshot {
+            generated_at_epoch_secs: generated,
+            configured_dc_groups: 5,
+            configured_endpoints: 12,
+            available_endpoints: 12,
+            available_pct: 100.0,
+            required_writers: required,
+            alive_writers: alive,
+            coverage_pct: 0.0,
+            fresh_alive_writers: fresh,
+            fresh_coverage_pct: 0.0,
+            writers: vec![],
+            dcs,
+        }
+    }
+
+    #[test]
+    fn coverage_pct_uses_summed_ratio_not_mean_of_per_shard_pcts() {
+        // Shard A: 1 alive / 1 required (100%). Shard B: 0 alive / 99
+        // required (0%). Naïve mean would report 50% — but system-wide
+        // coverage is actually 1/100 = 1%. This test fails if any future
+        // refactor reverts to mean.
+        let a = status_snap(100, 1, 1, 1, vec![]);
+        let b = status_snap(200, 99, 0, 0, vec![]);
+        let merged = merge_status_snapshots(vec![a, b]);
+        assert_eq!(merged.required_writers, 100);
+        assert_eq!(merged.alive_writers, 1);
+        assert!(
+            (merged.coverage_pct - 1.0).abs() < 1e-9,
+            "expected 1%, got {}",
+            merged.coverage_pct
+        );
+        // generated takes max
+        assert_eq!(merged.generated_at_epoch_secs, 200);
+    }
+
+    #[test]
+    fn dcs_merge_by_id_and_sum_writer_counts() {
+        // Both shards see DC -2 + DC 2. Merged should have 2 DCs and
+        // doubled writer counts.
+        let a = status_snap(
+            100,
+            6,
+            4,
+            3,
+            vec![
+                dc_snap(-2, 3, 2, 2, vec![ep("1.1.1.1:443")], Some(10.0)),
+                dc_snap(2, 3, 2, 1, vec![ep("2.2.2.2:443")], Some(20.0)),
+            ],
+        );
+        let b = status_snap(
+            150,
+            6,
+            5,
+            4,
+            vec![
+                dc_snap(-2, 3, 3, 3, vec![ep("1.1.1.1:443")], Some(8.0)),
+                dc_snap(2, 3, 2, 1, vec![ep("2.2.2.2:443")], Some(25.0)),
+            ],
+        );
+        let merged = merge_status_snapshots(vec![a, b]);
+        assert_eq!(merged.dcs.len(), 2);
+        let dc_neg2 = merged.dcs.iter().find(|d| d.dc == -2).unwrap();
+        assert_eq!(dc_neg2.required_writers, 6);
+        assert_eq!(dc_neg2.alive_writers, 5);
+        assert_eq!(dc_neg2.fresh_alive_writers, 5);
+        // RTT: takes the minimum of contributing shards' RTTs.
+        assert_eq!(dc_neg2.rtt_ms, Some(8.0));
+        // coverage_pct recomputed: 5 / 6 = 83.33...
+        assert!((dc_neg2.coverage_pct - (5.0 * 100.0 / 6.0)).abs() < 1e-9);
+        // endpoint_writers: same endpoint contributed 1 writer per shard → 2 total.
+        assert_eq!(dc_neg2.endpoint_writers.len(), 1);
+        assert_eq!(dc_neg2.endpoint_writers[0].active_writers, 2);
+    }
+
+    #[test]
+    fn dcs_present_in_only_one_shard_still_appear_in_merge() {
+        // Edge case: one shard sees DC 5 (perhaps because its source IP
+        // is the only one with that DC routable). The merged view must
+        // include it — losing it would silently misrepresent the system.
+        let a = status_snap(100, 2, 2, 2, vec![dc_snap(5, 2, 2, 2, vec![], None)]);
+        let b = status_snap(100, 0, 0, 0, vec![]);
+        let merged = merge_status_snapshots(vec![a, b]);
+        assert_eq!(merged.dcs.len(), 1);
+        assert_eq!(merged.dcs[0].dc, 5);
+        assert_eq!(merged.dcs[0].alive_writers, 2);
+    }
+
+    #[test]
+    fn coverage_pct_handles_zero_denominator() {
+        // A shard with 0 required (e.g. no DCs configured) must not
+        // divide by zero — coverage stays 0.
+        let a = status_snap(100, 0, 0, 0, vec![]);
+        let merged = merge_status_snapshots(vec![a]);
+        assert_eq!(merged.coverage_pct, 0.0);
+        assert_eq!(merged.fresh_coverage_pct, 0.0);
+    }
+
+    #[test]
+    fn writers_concatenate_across_shards() {
+        let mut a = status_snap(100, 2, 2, 2, vec![]);
+        a.writers
+            .push(super::super::pool_status::MeApiWriterStatusSnapshot {
+                writer_id: 1,
+                dc: Some(-2),
+                endpoint: ep("1.1.1.1:443"),
+                generation: 1,
+                state: "active",
+                draining: false,
+                degraded: false,
+                bound_clients: 0,
+                idle_for_secs: None,
+                rtt_ema_ms: None,
+                matches_active_generation: true,
+                in_desired_map: true,
+                allow_drain_fallback: false,
+                drain_started_at_epoch_secs: None,
+                drain_deadline_epoch_secs: None,
+                drain_over_ttl: false,
+            });
+        let mut b = status_snap(100, 2, 2, 2, vec![]);
+        b.writers
+            .push(super::super::pool_status::MeApiWriterStatusSnapshot {
+                writer_id: 99,
+                dc: Some(2),
+                endpoint: ep("2.2.2.2:443"),
+                generation: 1,
+                state: "active",
+                draining: false,
+                degraded: false,
+                bound_clients: 0,
+                idle_for_secs: None,
+                rtt_ema_ms: None,
+                matches_active_generation: true,
+                in_desired_map: true,
+                allow_drain_fallback: false,
+                drain_started_at_epoch_secs: None,
+                drain_deadline_epoch_secs: None,
+                drain_over_ttl: false,
+            });
+        let merged = merge_status_snapshots(vec![a, b]);
+        assert_eq!(merged.writers.len(), 2);
+        let ids: Vec<u64> = merged.writers.iter().map(|w| w.writer_id).collect();
+        assert!(ids.contains(&1) && ids.contains(&99));
+    }
+
+    #[test]
+    fn runtime_generations_take_minimum() {
+        // Lying about generation would let operators believe a rotation
+        // completed when one shard is still on the old generation. Take
+        // min so "system is past N" is true iff every shard is past N.
+        let mut a = empty_runtime();
+        a.active_generation = 5;
+        a.warm_generation = 4;
+        a.pending_hardswap_generation = 6;
+        let mut b = empty_runtime();
+        b.active_generation = 3;
+        b.warm_generation = 5;
+        b.pending_hardswap_generation = 2;
+        let merged = merge_runtime_snapshots(vec![a, b]);
+        assert_eq!(merged.active_generation, 3, "min(5, 3) = 3");
+        assert_eq!(merged.warm_generation, 4, "min(4, 5) = 4");
+        assert_eq!(merged.pending_hardswap_generation, 2, "min(6, 2) = 2");
+    }
+
+    #[test]
+    fn runtime_pending_hardswap_age_takes_max_or_none() {
+        let mut a = empty_runtime();
+        a.pending_hardswap_age_secs = Some(120);
+        let mut b = empty_runtime();
+        b.pending_hardswap_age_secs = Some(60);
+        let mut c = empty_runtime();
+        c.pending_hardswap_age_secs = None;
+        let merged = merge_runtime_snapshots(vec![a, b, c]);
+        assert_eq!(merged.pending_hardswap_age_secs, Some(120));
+
+        let merged_all_none = merge_runtime_snapshots(vec![empty_runtime(), empty_runtime()]);
+        assert_eq!(merged_all_none.pending_hardswap_age_secs, None);
+    }
+
+    #[test]
+    fn runtime_writer_counts_sum_across_shards() {
+        let mut a = empty_runtime();
+        a.adaptive_floor_active_writers_current = 30;
+        a.adaptive_floor_warm_writers_current = 5;
+        a.adaptive_floor_target_writers_total = 36;
+        let mut b = empty_runtime();
+        b.adaptive_floor_active_writers_current = 25;
+        b.adaptive_floor_warm_writers_current = 7;
+        b.adaptive_floor_target_writers_total = 30;
+        let merged = merge_runtime_snapshots(vec![a, b]);
+        assert_eq!(merged.adaptive_floor_active_writers_current, 55);
+        assert_eq!(merged.adaptive_floor_warm_writers_current, 12);
+        assert_eq!(merged.adaptive_floor_target_writers_total, 66);
+    }
+
+    #[test]
+    fn runtime_quarantine_union_by_endpoint_takes_max_remaining() {
+        // Same endpoint quarantined in two shards with different
+        // remaining_ms. Merged should show endpoint once, with the
+        // longest remaining — that's the worst case operator should see.
+        let mut a = empty_runtime();
+        a.quarantined_endpoints = vec![
+            MeApiQuarantinedEndpointSnapshot {
+                endpoint: ep("9.9.9.9:443"),
+                remaining_ms: 5000,
+            },
+            MeApiQuarantinedEndpointSnapshot {
+                endpoint: ep("1.1.1.1:443"),
+                remaining_ms: 3000,
+            },
+        ];
+        let mut b = empty_runtime();
+        b.quarantined_endpoints = vec![MeApiQuarantinedEndpointSnapshot {
+            endpoint: ep("9.9.9.9:443"),
+            remaining_ms: 12000,
+        }];
+        let merged = merge_runtime_snapshots(vec![a, b]);
+        assert_eq!(merged.quarantined_endpoints.len(), 2);
+        let nines = merged
+            .quarantined_endpoints
+            .iter()
+            .find(|q| q.endpoint == ep("9.9.9.9:443"))
+            .unwrap();
+        assert_eq!(nines.remaining_ms, 12000, "should take max remaining");
+    }
+
+    #[test]
+    fn single_shard_runtime_passthrough_is_byte_identical() {
+        // Default (round_robin) mode wraps a single MePool; the merge
+        // helper should be exactly equivalent to passing through the one
+        // input. This is the back-compat invariant that lets us swap to
+        // aggregation without changing single-shard observable behaviour.
+        let mut input = empty_runtime();
+        input.active_generation = 42;
+        input.pending_hardswap_age_secs = Some(7);
+        input.adaptive_floor_active_writers_current = 100;
+        input.quarantined_endpoints = vec![MeApiQuarantinedEndpointSnapshot {
+            endpoint: ep("4.4.4.4:443"),
+            remaining_ms: 999,
+        }];
+        let merged = merge_runtime_snapshots(vec![input.clone()]);
+        assert_eq!(merged.active_generation, input.active_generation);
+        assert_eq!(merged.warm_generation, input.warm_generation);
+        assert_eq!(merged.pending_hardswap_age_secs, Some(7));
+        assert_eq!(
+            merged.adaptive_floor_active_writers_current,
+            input.adaptive_floor_active_writers_current
+        );
+        assert_eq!(merged.quarantined_endpoints.len(), 1);
     }
 }

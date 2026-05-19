@@ -164,10 +164,10 @@ async fn current_me_pool_stage_progress(shared: &ApiShared) -> Option<f64> {
         return None;
     }
 
-    // Stats / status read from the primary shard for now. Phase 2c will
-    // aggregate writers + DC views across all `mux.shards()`.
-    let pool = shared.me_pool.read().await.as_ref()?.primary().clone();
-    let status = pool.api_status_snapshot().await;
+    // Aggregate across shards so the readiness progress reflects every
+    // shard's contribution to writer coverage, not just primary's.
+    let mux = shared.me_pool.read().await.as_ref()?.clone();
+    let status = mux.aggregate_status_snapshot().await;
     let configured_dc_groups = status.configured_dc_groups;
     let covered_dc_groups = status.dcs.iter().filter(|dc| dc.alive_writers > 0).count();
 

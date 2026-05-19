@@ -282,13 +282,7 @@ pub(super) fn build_security_whitelist_data(cfg: &ProxyConfig) -> SecurityWhitel
 
 pub(super) async fn build_runtime_me_pool_state_data(shared: &ApiShared) -> RuntimeMePoolStateData {
     let now_epoch_secs = now_epoch_secs();
-    let Some(pool) = shared
-        .me_pool
-        .read()
-        .await
-        .as_ref()
-        .map(|mux| mux.primary().clone())
-    else {
+    let Some(mux) = shared.me_pool.read().await.as_ref().cloned() else {
         return RuntimeMePoolStateData {
             enabled: false,
             reason: Some(SOURCE_UNAVAILABLE_REASON),
@@ -297,9 +291,13 @@ pub(super) async fn build_runtime_me_pool_state_data(shared: &ApiShared) -> Runt
         };
     };
 
-    let status = pool.api_status_snapshot().await;
-    let runtime = pool.api_runtime_snapshot().await;
-    let refill = pool.api_refill_snapshot().await;
+    // Status + runtime aggregate across shards (writer pools sum, DCs
+    // merge by id). Refill stays primary-only — that surface tracks
+    // in-flight refill operations which are shard-private and don't yet
+    // have a defined cross-shard semantic.
+    let status = mux.aggregate_status_snapshot().await;
+    let runtime = mux.aggregate_runtime_snapshot().await;
+    let refill = mux.primary().api_refill_snapshot().await;
 
     let mut draining_generations = BTreeSet::<u64>::new();
     let mut contour_warm = 0usize;
@@ -378,13 +376,7 @@ pub(super) async fn build_runtime_me_pool_state_data(shared: &ApiShared) -> Runt
 
 pub(super) async fn build_runtime_me_quality_data(shared: &ApiShared) -> RuntimeMeQualityData {
     let now_epoch_secs = now_epoch_secs();
-    let Some(pool) = shared
-        .me_pool
-        .read()
-        .await
-        .as_ref()
-        .map(|mux| mux.primary().clone())
-    else {
+    let Some(mux) = shared.me_pool.read().await.as_ref().cloned() else {
         return RuntimeMeQualityData {
             enabled: false,
             reason: Some(SOURCE_UNAVAILABLE_REASON),
@@ -393,7 +385,11 @@ pub(super) async fn build_runtime_me_quality_data(shared: &ApiShared) -> Runtime
         };
     };
 
-    let status = pool.api_status_snapshot().await;
+    // Quality metrics: writer counts aggregate. Family-state is a
+    // per-pool network probe view — take primary's; cross-shard family
+    // unification would need a separate design pass.
+    let status = mux.aggregate_status_snapshot().await;
+    let pool = mux.primary();
     let family_states = pool
         .api_family_state_snapshot()
         .into_iter()
