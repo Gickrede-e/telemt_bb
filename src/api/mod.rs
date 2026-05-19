@@ -60,8 +60,8 @@ use runtime_min::{
 };
 use runtime_selftest::build_runtime_me_selftest_data;
 use runtime_stats::{
-    MinimalCacheEntry, build_dcs_data, build_me_writers_data, build_minimal_all_data,
-    build_upstreams_data, build_zero_all_data,
+    MinimalCacheEntry, build_dcs_data, build_me_writers_by_shard_data, build_me_writers_data,
+    build_minimal_all_data, build_upstreams_data, build_zero_all_data,
 };
 use runtime_watch::spawn_runtime_watchers;
 use runtime_zero::{
@@ -426,6 +426,16 @@ async fn handle(
             ("GET", "/v1/stats/me-writers") => {
                 let revision = current_revision(&shared.config_path).await?;
                 let data = build_me_writers_data(shared.as_ref(), api_cfg).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/stats/me-writers/by-shard") => {
+                // Per-shard breakdown of the writer pool — Phase 2d.
+                // The aggregated /v1/stats/me-writers shows the system
+                // total (sum across shards). Operators debugging shard
+                // imbalance need the per-shard view to find which
+                // source IP is starving; this is that view.
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_me_writers_by_shard_data(shared.as_ref(), api_cfg).await;
                 Ok(success_response(StatusCode::OK, data, revision))
             }
             ("GET", "/v1/stats/dcs") => {

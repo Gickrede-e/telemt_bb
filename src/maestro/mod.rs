@@ -830,6 +830,7 @@ async fn run_telemt_core(
         shared_state.clone(),
         ip_tracker.clone(),
         tls_cache.clone(),
+        api_me_pool.clone(),
         config_rx.clone(),
     )
     .await;

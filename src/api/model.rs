@@ -359,6 +359,44 @@ pub(super) struct DcStatusData {
     pub(super) dcs: Vec<DcStatus>,
 }
 
+/// One shard's slice of the writer pool — output of
+/// `/v1/stats/me-writers/by-shard`. Operators reading this need to
+/// answer "is shard N healthy / balanced?", so we expose the same
+/// numerical signals as the aggregated `MeWritersSummary` but scoped to
+/// one shard, plus the shard's identifier (index + bound source IP).
+///
+/// We deliberately do NOT include the full writers Vec here — that
+/// would explode the payload (potentially thousands per shard × N
+/// shards). Operators who want per-writer detail can hit the existing
+/// `/v1/stats/me-writers` and filter client-side.
+#[derive(Serialize, Clone)]
+pub(super) struct ShardEntry {
+    pub(super) shard_idx: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) bind_address: Option<String>,
+    pub(super) summary: MeWritersSummary,
+    pub(super) dcs: Vec<DcStatus>,
+    /// Number of writers in this shard's `writers` Vec on the aggregated
+    /// endpoint — operators use this to confirm shard-level writer
+    /// counts add up to the system total without fetching the full
+    /// writers Vec.
+    pub(super) writers_count: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub(super) struct MeWritersByShardData {
+    pub(super) middle_proxy_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<&'static str>,
+    pub(super) generated_at_epoch_secs: u64,
+    /// Mode the proxy is running in — `"shard"` when N>=2 shards are
+    /// active, `"round_robin"` otherwise. Lets clients distinguish a
+    /// 1-element shards array (legacy single-pool) from genuine sharding.
+    pub(super) mode: &'static str,
+    pub(super) shard_count: usize,
+    pub(super) shards: Vec<ShardEntry>,
+}
+
 #[derive(Serialize, Clone)]
 pub(super) struct MinimalQuarantineData {
     pub(super) endpoint: String,

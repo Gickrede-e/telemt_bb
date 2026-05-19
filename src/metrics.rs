@@ -23,6 +23,7 @@ use crate::stats::beobachten::BeobachtenStore;
 use crate::tls_front::TlsFrontCache;
 use crate::tls_front::cache;
 use crate::tls_front::fetcher;
+use crate::transport::middle_proxy::MePoolMux;
 use crate::transport::{ListenOptions, create_listener};
 
 // Keeps `/metrics` response size bounded when per-user telemetry is enabled.
@@ -41,6 +42,7 @@ pub async fn serve(
     shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
     tls_cache: Option<Arc<TlsFrontCache>>,
+    me_pool: Arc<tokio::sync::RwLock<Option<Arc<MePoolMux>>>>,
     config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
     whitelist: Vec<IpNetwork>,
 ) {
@@ -66,6 +68,7 @@ pub async fn serve(
                     shared_state,
                     ip_tracker,
                     tls_cache,
+                    me_pool,
                     config_rx,
                     whitelist,
                 )
@@ -122,6 +125,7 @@ pub async fn serve(
                 shared_state,
                 ip_tracker,
                 tls_cache,
+                me_pool,
                 config_rx,
                 whitelist,
             )
@@ -133,6 +137,7 @@ pub async fn serve(
             let shared_state_v6 = shared_state.clone();
             let ip_tracker_v6 = ip_tracker.clone();
             let tls_cache_v6 = tls_cache.clone();
+            let me_pool_v6 = me_pool.clone();
             let config_rx_v6 = config_rx.clone();
             let whitelist_v6 = whitelist.clone();
             tokio::spawn(async move {
@@ -143,6 +148,7 @@ pub async fn serve(
                     shared_state_v6,
                     ip_tracker_v6,
                     tls_cache_v6,
+                    me_pool_v6,
                     config_rx_v6,
                     whitelist_v6,
                 )
@@ -155,6 +161,7 @@ pub async fn serve(
                 shared_state,
                 ip_tracker,
                 tls_cache,
+                me_pool,
                 config_rx,
                 whitelist,
             )
@@ -185,6 +192,7 @@ async fn serve_listener(
     shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
     tls_cache: Option<Arc<TlsFrontCache>>,
+    me_pool: Arc<tokio::sync::RwLock<Option<Arc<MePoolMux>>>>,
     config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
     whitelist: Arc<Vec<IpNetwork>>,
 ) {
@@ -221,6 +229,7 @@ async fn serve_listener(
         let shared_state = shared_state.clone();
         let ip_tracker = ip_tracker.clone();
         let tls_cache = tls_cache.clone();
+        let me_pool = me_pool.clone();
         let config_rx_conn = config_rx.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
@@ -230,6 +239,7 @@ async fn serve_listener(
                 let shared_state = shared_state.clone();
                 let ip_tracker = ip_tracker.clone();
                 let tls_cache = tls_cache.clone();
+                let me_pool = me_pool.clone();
                 let config = config_rx_conn.borrow().clone();
                 async move {
                     handle(
@@ -239,6 +249,7 @@ async fn serve_listener(
                         &shared_state,
                         &ip_tracker,
                         tls_cache.as_deref(),
+                        me_pool.as_ref(),
                         &config,
                     )
                     .await
@@ -273,10 +284,12 @@ async fn handle<B>(
     shared_state: &ProxySharedState,
     ip_tracker: &UserIpTracker,
     tls_cache: Option<&TlsFrontCache>,
+    me_pool: &tokio::sync::RwLock<Option<Arc<MePoolMux>>>,
     config: &ProxyConfig,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if req.uri().path() == "/metrics" {
-        let body = render_metrics(stats, shared_state, config, ip_tracker, tls_cache).await;
+        let body =
+            render_metrics(stats, shared_state, config, ip_tracker, tls_cache, me_pool).await;
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
@@ -443,6 +456,7 @@ async fn render_metrics(
     config: &ProxyConfig,
     ip_tracker: &UserIpTracker,
     tls_cache: Option<&TlsFrontCache>,
+    me_pool: &tokio::sync::RwLock<Option<Arc<MePoolMux>>>,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(4096);
@@ -3685,7 +3699,130 @@ async fn render_metrics(
         unique_ip_suppressed
     );
 
+    // Per-shard ME pool metrics (Phase 2 sharding). Each gauge carries
+    // `shard` (numeric index) and `bind` (source IP string, empty when
+    // legacy single-pool) labels so Grafana/alertmanager can split
+    // alerts per source IP. We don't emit anything when telemetry's
+    // me-level disables normal metrics (matches the gate applied above
+    // to other me_ counters), and we silently no-op when the proxy is
+    // running in direct-only mode (mux is None).
+    if me_allows_normal && let Some(mux) = me_pool.read().await.as_ref().cloned() {
+        render_per_shard_me_metrics(&mut out, &mux).await;
+    }
+
     out
+}
+
+/// Emit per-shard ME pool gauges as labeled Prometheus series. Lifts
+/// the `alive_writers` / `required_writers` / `coverage_pct` /
+/// `endpoint availability` view into shard-aware land so operators can
+/// alert on a single source IP starving without needing to scrape
+/// `/v1/stats/me-writers/by-shard` separately.
+///
+/// The metric names mirror the aggregated counters (no `_per_shard`
+/// suffix) — Prometheus rules can sum-without-label to recover the
+/// aggregate. That convention keeps existing Grafana panels working
+/// for single-shard deployments while shard-aware ones can add a
+/// `shard=` group_by.
+async fn render_per_shard_me_metrics(out: &mut String, mux: &MePoolMux) {
+    use std::fmt::Write;
+    let snaps = mux.per_shard_status_snapshots().await;
+    let bind_addrs = mux.bind_addrs();
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_shard_alive_writers Per-shard live ME writers (labels: shard, bind)"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_shard_alive_writers gauge");
+    for (idx, snap) in snaps.iter().enumerate() {
+        let bind = bind_addrs
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "telemt_me_shard_alive_writers{{shard=\"{}\",bind=\"{}\"}} {}",
+            idx, bind, snap.alive_writers
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_shard_required_writers Per-shard adaptive-floor target (labels: shard, bind)"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_shard_required_writers gauge");
+    for (idx, snap) in snaps.iter().enumerate() {
+        let bind = bind_addrs
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "telemt_me_shard_required_writers{{shard=\"{}\",bind=\"{}\"}} {}",
+            idx, bind, snap.required_writers
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_shard_fresh_alive_writers Per-shard ME writers not in drain/zombie state (labels: shard, bind)"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_shard_fresh_alive_writers gauge");
+    for (idx, snap) in snaps.iter().enumerate() {
+        let bind = bind_addrs
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "telemt_me_shard_fresh_alive_writers{{shard=\"{}\",bind=\"{}\"}} {}",
+            idx, bind, snap.fresh_alive_writers
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_shard_coverage_pct Per-shard alive/required writer ratio (labels: shard, bind)"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_shard_coverage_pct gauge");
+    for (idx, snap) in snaps.iter().enumerate() {
+        let bind = bind_addrs
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "telemt_me_shard_coverage_pct{{shard=\"{}\",bind=\"{}\"}} {:.2}",
+            idx, bind, snap.coverage_pct
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_shard_available_endpoints Per-shard endpoints with at least one live writer (labels: shard, bind)"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_shard_available_endpoints gauge");
+    for (idx, snap) in snaps.iter().enumerate() {
+        let bind = bind_addrs
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "telemt_me_shard_available_endpoints{{shard=\"{}\",bind=\"{}\"}} {}",
+            idx, bind, snap.available_endpoints
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3766,7 +3903,15 @@ mod tests {
             .await
             .unwrap();
 
-        let output = render_metrics(&stats, shared_state.as_ref(), &config, &tracker, None).await;
+        let output = render_metrics(
+            &stats,
+            shared_state.as_ref(),
+            &config,
+            &tracker,
+            None,
+            &tokio::sync::RwLock::new(None),
+        )
+        .await;
 
         assert!(output.contains(&format!(
             "telemt_build_info{{version=\"{}\"}} 1",
@@ -3880,7 +4025,15 @@ mod tests {
             )
             .await;
 
-        let output = render_metrics(&stats, &shared_state, &config, &tracker, Some(&cache)).await;
+        let output = render_metrics(
+            &stats,
+            &shared_state,
+            &config,
+            &tracker,
+            Some(&cache),
+            &tokio::sync::RwLock::new(None),
+        )
+        .await;
 
         assert!(output.contains("telemt_tls_front_profile_domains{status=\"configured\"} 2"));
         assert!(output.contains("telemt_tls_front_profile_domains{status=\"emitted\"} 2"));
@@ -3916,7 +4069,15 @@ mod tests {
         let shared_state = ProxySharedState::new();
         let tracker = UserIpTracker::new();
         let config = ProxyConfig::default();
-        let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
+        let output = render_metrics(
+            &stats,
+            &shared_state,
+            &config,
+            &tracker,
+            None,
+            &tokio::sync::RwLock::new(None),
+        )
+        .await;
         assert!(output.contains("telemt_connections_total 0"));
         assert!(output.contains("telemt_connections_bad_total 0"));
         assert!(output.contains("telemt_handshake_timeouts_total 0"));
@@ -3940,7 +4101,15 @@ mod tests {
         let mut config = ProxyConfig::default();
         config.access.user_max_unique_ips_global_each = 2;
 
-        let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
+        let output = render_metrics(
+            &stats,
+            &shared_state,
+            &config,
+            &tracker,
+            None,
+            &tokio::sync::RwLock::new(None),
+        )
+        .await;
 
         assert!(output.contains("telemt_user_unique_ips_limit{user=\"alice\"} 2"));
         assert!(output.contains("telemt_user_unique_ips_utilization{user=\"alice\"} 0.500000"));
@@ -3952,7 +4121,15 @@ mod tests {
         let shared_state = ProxySharedState::new();
         let tracker = UserIpTracker::new();
         let config = ProxyConfig::default();
-        let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
+        let output = render_metrics(
+            &stats,
+            &shared_state,
+            &config,
+            &tracker,
+            None,
+            &tokio::sync::RwLock::new(None),
+        )
+        .await;
         assert!(output.contains("# TYPE telemt_uptime_seconds gauge"));
         assert!(output.contains("# TYPE telemt_connections_total counter"));
         assert!(output.contains("# TYPE telemt_connections_bad_total counter"));
@@ -4024,6 +4201,7 @@ mod tests {
         stats.increment_connects_all();
 
         let req = Request::builder().uri("/metrics").body(()).unwrap();
+        let me_pool_test = tokio::sync::RwLock::new(None);
         let resp = handle(
             req,
             &stats,
@@ -4031,6 +4209,7 @@ mod tests {
             shared_state.as_ref(),
             &tracker,
             None,
+            &me_pool_test,
             &config,
         )
         .await
@@ -4058,6 +4237,7 @@ mod tests {
             "203.0.113.10".parse::<IpAddr>().unwrap(),
             Duration::from_secs(600),
         );
+        let me_pool_beob = tokio::sync::RwLock::new(None);
         let req_beob = Request::builder().uri("/beobachten").body(()).unwrap();
         let resp_beob = handle(
             req_beob,
@@ -4066,6 +4246,7 @@ mod tests {
             shared_state.as_ref(),
             &tracker,
             None,
+            &me_pool_beob,
             &config,
         )
         .await
@@ -4076,6 +4257,7 @@ mod tests {
         assert!(beob_text.contains("[TLS-scanner]"));
         assert!(beob_text.contains("203.0.113.10-1"));
 
+        let me_pool_404 = tokio::sync::RwLock::new(None);
         let req404 = Request::builder().uri("/other").body(()).unwrap();
         let resp404 = handle(
             req404,
@@ -4084,6 +4266,7 @@ mod tests {
             shared_state.as_ref(),
             &tracker,
             None,
+            &me_pool_404,
             &config,
         )
         .await

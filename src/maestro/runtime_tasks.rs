@@ -398,6 +398,13 @@ pub(crate) async fn spawn_metrics_if_configured(
     shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
     tls_cache: Option<Arc<TlsFrontCache>>,
+    // Same RwLock as `api::ApiShared::me_pool` — the metrics endpoint
+    // holds this so its per-shard gauges reflect mux state set after
+    // process start (supplementary shards write back as their
+    // background supervisors finish). A point-in-time snapshot would
+    // freeze at "None" if metrics::serve happened to start before the
+    // mux was published.
+    api_me_pool: Arc<tokio::sync::RwLock<Option<Arc<MePoolMux>>>>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
 ) {
     // metrics_listen takes precedence; fall back to metrics_port for backward compat.
@@ -434,6 +441,7 @@ pub(crate) async fn spawn_metrics_if_configured(
         let config_rx_metrics = config_rx.clone();
         let ip_tracker_metrics = ip_tracker.clone();
         let tls_cache_metrics = tls_cache.clone();
+        let me_pool_metrics = api_me_pool.clone();
         let whitelist = config.server.metrics_whitelist.clone();
         let listen_backlog = config.server.listen_backlog;
         tokio::spawn(async move {
@@ -446,6 +454,7 @@ pub(crate) async fn spawn_metrics_if_configured(
                 shared_state,
                 ip_tracker_metrics,
                 tls_cache_metrics,
+                me_pool_metrics,
                 config_rx_metrics,
                 whitelist,
             )

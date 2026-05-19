@@ -7,11 +7,11 @@ use crate::transport::upstream::IpPreference;
 
 use super::ApiShared;
 use super::model::{
-    ClassCount, DcEndpointWriters, DcStatus, DcStatusData, MeWriterStatus, MeWritersData,
-    MeWritersSummary, MinimalAllData, MinimalAllPayload, MinimalDcPathData, MinimalMeRuntimeData,
-    MinimalQuarantineData, UpstreamDcStatus, UpstreamStatus, UpstreamSummaryData, UpstreamsData,
-    ZeroAllData, ZeroCodeCount, ZeroCoreData, ZeroDesyncData, ZeroMiddleProxyData, ZeroPoolData,
-    ZeroUpstreamData,
+    ClassCount, DcEndpointWriters, DcStatus, DcStatusData, MeWriterStatus, MeWritersByShardData,
+    MeWritersData, MeWritersSummary, MinimalAllData, MinimalAllPayload, MinimalDcPathData,
+    MinimalMeRuntimeData, MinimalQuarantineData, ShardEntry, UpstreamDcStatus, UpstreamStatus,
+    UpstreamSummaryData, UpstreamsData, ZeroAllData, ZeroCodeCount, ZeroCoreData, ZeroDesyncData,
+    ZeroMiddleProxyData, ZeroPoolData, ZeroUpstreamData,
 };
 
 const FEATURE_DISABLED_REASON: &str = "feature_disabled";
@@ -394,35 +394,7 @@ async fn get_minimal_payload_cached(
         dcs: status
             .dcs
             .into_iter()
-            .map(|entry| DcStatus {
-                dc: entry.dc,
-                endpoints: entry
-                    .endpoints
-                    .into_iter()
-                    .map(|value| value.to_string())
-                    .collect(),
-                endpoint_writers: entry
-                    .endpoint_writers
-                    .into_iter()
-                    .map(|coverage| DcEndpointWriters {
-                        endpoint: coverage.endpoint.to_string(),
-                        active_writers: coverage.active_writers,
-                    })
-                    .collect(),
-                available_endpoints: entry.available_endpoints,
-                available_pct: entry.available_pct,
-                required_writers: entry.required_writers,
-                floor_min: entry.floor_min,
-                floor_target: entry.floor_target,
-                floor_max: entry.floor_max,
-                floor_capped: entry.floor_capped,
-                alive_writers: entry.alive_writers,
-                coverage_pct: entry.coverage_pct,
-                fresh_alive_writers: entry.fresh_alive_writers,
-                fresh_coverage_pct: entry.fresh_coverage_pct,
-                rtt_ms: entry.rtt_ms,
-                load: entry.load,
-            })
+            .map(dc_status_from_snapshot)
             .collect(),
     };
     let me_runtime = MinimalMeRuntimeData {
@@ -579,4 +551,135 @@ fn now_epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Map one `MeApiDcStatusSnapshot` (internal transport-layer struct) to
+/// the API-layer `DcStatus`. Shared by aggregate + per-shard endpoints
+/// so a field added to one will surface in the other automatically.
+fn dc_status_from_snapshot(
+    entry: crate::transport::middle_proxy::MeApiDcStatusSnapshot,
+) -> DcStatus {
+    DcStatus {
+        dc: entry.dc,
+        endpoints: entry
+            .endpoints
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect(),
+        endpoint_writers: entry
+            .endpoint_writers
+            .into_iter()
+            .map(|coverage| DcEndpointWriters {
+                endpoint: coverage.endpoint.to_string(),
+                active_writers: coverage.active_writers,
+            })
+            .collect(),
+        available_endpoints: entry.available_endpoints,
+        available_pct: entry.available_pct,
+        required_writers: entry.required_writers,
+        floor_min: entry.floor_min,
+        floor_target: entry.floor_target,
+        floor_max: entry.floor_max,
+        floor_capped: entry.floor_capped,
+        alive_writers: entry.alive_writers,
+        coverage_pct: entry.coverage_pct,
+        fresh_alive_writers: entry.fresh_alive_writers,
+        fresh_coverage_pct: entry.fresh_coverage_pct,
+        rtt_ms: entry.rtt_ms,
+        load: entry.load,
+    }
+}
+
+/// Build `MeWritersSummary` from one shard's `MeApiStatusSnapshot` — no
+/// aggregation, just shape conversion. Callers that want the system-
+/// wide view use `mux.aggregate_status_snapshot()` and then map; this
+/// helper handles a single shard's slice in /v1/stats/me-writers/by-
+/// shard.
+fn summary_from_snapshot(
+    status: &crate::transport::middle_proxy::MeApiStatusSnapshot,
+) -> MeWritersSummary {
+    MeWritersSummary {
+        configured_dc_groups: status.configured_dc_groups,
+        configured_endpoints: status.configured_endpoints,
+        available_endpoints: status.available_endpoints,
+        available_pct: status.available_pct,
+        required_writers: status.required_writers,
+        alive_writers: status.alive_writers,
+        coverage_pct: status.coverage_pct,
+        fresh_alive_writers: status.fresh_alive_writers,
+        fresh_coverage_pct: status.fresh_coverage_pct,
+    }
+}
+
+pub(super) async fn build_me_writers_by_shard_data(
+    shared: &ApiShared,
+    api_cfg: &ApiConfig,
+) -> MeWritersByShardData {
+    let now = now_epoch_secs();
+    if !api_cfg.minimal_runtime_enabled {
+        return MeWritersByShardData {
+            middle_proxy_enabled: false,
+            reason: Some(FEATURE_DISABLED_REASON),
+            generated_at_epoch_secs: now,
+            mode: "round_robin",
+            shard_count: 0,
+            shards: vec![],
+        };
+    }
+    let Some(mux) = shared.me_pool.read().await.as_ref().cloned() else {
+        return MeWritersByShardData {
+            middle_proxy_enabled: false,
+            reason: Some(SOURCE_UNAVAILABLE_REASON),
+            generated_at_epoch_secs: now,
+            mode: "round_robin",
+            shard_count: 0,
+            shards: vec![],
+        };
+    };
+
+    let snapshots = mux.per_shard_status_snapshots().await;
+    let bind_addrs = mux.bind_addrs();
+    // A bind address pinned per shard means the mux is in shard mode;
+    // single-element `[None]` is the legacy passthrough wrapper.
+    let mode = if snapshots.len() > 1 || bind_addrs.first().is_some_and(|a| a.is_some()) {
+        "shard"
+    } else {
+        "round_robin"
+    };
+
+    let shards: Vec<ShardEntry> = snapshots
+        .iter()
+        .enumerate()
+        .map(|(idx, snap)| ShardEntry {
+            shard_idx: idx,
+            bind_address: bind_addrs
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|ip| ip.to_string()),
+            summary: summary_from_snapshot(snap),
+            dcs: snap
+                .dcs
+                .iter()
+                .cloned()
+                .map(dc_status_from_snapshot)
+                .collect(),
+            writers_count: snap.writers.len(),
+        })
+        .collect();
+
+    let generated_at_epoch_secs = snapshots
+        .iter()
+        .map(|s| s.generated_at_epoch_secs)
+        .max()
+        .unwrap_or(now);
+
+    MeWritersByShardData {
+        middle_proxy_enabled: true,
+        reason: None,
+        generated_at_epoch_secs,
+        mode,
+        shard_count: shards.len(),
+        shards,
+    }
 }
