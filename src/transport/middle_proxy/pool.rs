@@ -450,6 +450,15 @@ pub struct MePool {
     /// MePoolMux pins shard N to bind_addresses[N]. None preserves the
     /// pre-sharding behaviour (rr / single bind).
     pub(super) shard_bind_override: Option<IpAddr>,
+    /// System-wide cap on concurrent outbound TG connect attempts,
+    /// shared across every shard in this proxy's MePoolMux. Each shard
+    /// acquires a permit from the same Semaphore before connect_tcp; on
+    /// drop the permit returns. Without this, when N shards all see
+    /// load pressure simultaneously, each independently fires its
+    /// adaptive-floor scale-up wave — producing a burst that trips
+    /// Telegram's per-source-IP rapid-flap quarantine. None disables
+    /// (legacy single-pool path doesn't need cross-shard coordination).
+    pub(super) connect_concurrency_budget: Option<Arc<tokio::sync::Semaphore>>,
     pool_size: usize,
 }
 
@@ -582,6 +591,7 @@ impl MePool {
         me_route_inline_recovery_attempts: u32,
         me_route_inline_recovery_wait_ms: u64,
         shard_bind_override: Option<IpAddr>,
+        connect_concurrency_budget: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Arc<Self> {
         let endpoint_dc_map = Self::build_endpoint_dc_map_from_maps(&proxy_map_v4, &proxy_map_v6);
         let preferred_endpoints_by_dc =
@@ -843,6 +853,7 @@ impl MePool {
             kdf_material_fingerprint: Arc::new(RwLock::new(HashMap::new())),
             runtime_ready: AtomicBool::new(false),
             shard_bind_override,
+            connect_concurrency_budget,
         })
     }
 

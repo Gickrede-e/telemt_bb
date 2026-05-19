@@ -731,6 +731,39 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub me_writer_bind_mode: MeWriterBindMode,
 
+    /// Global cap on concurrent outbound TG **connect + handshake**
+    /// slots across ALL shards. When the adaptive floor on multiple
+    /// shards decides to scale up simultaneously (e.g., load spike
+    /// that all shards observe at once), each fires writer-spawn
+    /// waves independently — without coordination, N shards × M
+    /// new-writers-per-shard produces a burst that trips Telegram's
+    /// per-source-IP connect-rate quarantine (`ME endpoint
+    /// temporarily quarantined due to rapid writer flap`).
+    ///
+    /// **Unit semantics:** each permit covers a full
+    /// `connect_tcp + handshake_only + writer-register` cycle —
+    /// typically 50ms–2s wall-clock depending on TG response time. So
+    /// `me_global_connect_concurrency = 36` means "at most 36
+    /// handshake-in-flight slots at once," NOT "36 SYNs per second."
+    /// Operators sizing this should think in slots-not-RPS: a higher
+    /// value handles bursts but lets more in-flight under failure.
+    ///
+    /// Permits queue rather than fail (the FIFO order is `tokio::sync
+    /// ::Semaphore`'s default), so the floor's scale-up always
+    /// completes — just smoothed across time instead of bursting.
+    /// Released on drop after handshake registration, even on error.
+    ///
+    /// `0` (default) disables — no cross-shard coordination, legacy
+    /// behaviour. Recommended starting point for shard mode: 64 (gives
+    /// margin while measuring handshake-duration distribution under
+    /// real load), then halve to 32 once you've seen the numbers in
+    /// `/v1/stats`. Has no effect in round_robin mode (single pool
+    /// already serialises its own connects via the per-DC
+    /// `refill_inflight` set).
+    /// Refs `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B+.
+    #[serde(default)]
+    pub me_global_connect_concurrency: u32,
+
     /// Grace period in seconds to hold static floor after activity in adaptive mode.
     #[serde(default = "default_me_adaptive_floor_recover_grace_secs")]
     pub me_adaptive_floor_recover_grace_secs: u64,
@@ -1132,6 +1165,7 @@ impl Default for GeneralConfig {
                 default_me_adaptive_floor_min_writers_multi_endpoint(),
             me_writer_bind_multiplier: default_me_writer_bind_multiplier(),
             me_writer_bind_mode: MeWriterBindMode::default(),
+            me_global_connect_concurrency: 0,
             me_adaptive_floor_recover_grace_secs: default_me_adaptive_floor_recover_grace_secs(),
             me_adaptive_floor_writers_per_core_total:
                 default_me_adaptive_floor_writers_per_core_total(),

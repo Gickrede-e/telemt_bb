@@ -114,6 +114,7 @@ async fn make_pool(me_pool_drain_threshold: u64) -> Arc<MePool> {
         general.me_route_inline_recovery_attempts,
         general.me_route_inline_recovery_wait_ms,
         None,
+        None,
     )
 }
 

@@ -213,6 +213,26 @@ pub(crate) async fn initialize_me_pool(
                 let shard_overrides = compute_shard_overrides(config);
                 let shard_count = shard_overrides.len();
 
+                // Shared connect-concurrency budget across all shards.
+                // Prevents the burst that hits TG when N shards see
+                // load simultaneously and each independently scales up
+                // their adaptive floor — without coordination 6 shards
+                // × ~10 writers/shard = 60 simultaneous connects to the
+                // same TG endpoints, which trips rapid-flap quarantine.
+                // Configured via `me_global_connect_concurrency` (0
+                // disables; recommended value is ~6×shard_count).
+                let connect_budget = match config.general.me_global_connect_concurrency {
+                    0 => None,
+                    n => Some(Arc::new(tokio::sync::Semaphore::new(n as usize))),
+                };
+                if connect_budget.is_some() {
+                    info!(
+                        concurrency = config.general.me_global_connect_concurrency,
+                        shards = shard_count,
+                        "Activated shared connect-concurrency budget across all shards"
+                    );
+                }
+
                 // Closure that builds one MePool with the given source-IP
                 // override. Captures every constructor input by reference
                 // and clones inside the body, so the closure is callable N
@@ -315,6 +335,7 @@ pub(crate) async fn initialize_me_pool(
                         config.general.me_route_inline_recovery_attempts,
                         config.general.me_route_inline_recovery_wait_ms,
                         override_bind,
+                        connect_budget.clone(),
                     )
                 };
 

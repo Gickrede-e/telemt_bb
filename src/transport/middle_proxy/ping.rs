@@ -357,6 +357,15 @@ pub async fn run_me_ping(pool: &Arc<MePool>, rng: &SecureRandom) -> Vec<MePingRe
             let mut error = None;
             let mut route = None;
 
+            // Intentionally bypasses `connect_concurrency_budget`: this
+            // is the `/v1/me/ping` operator diagnostic. Going through
+            // the budget here would let a flap-quarantine scenario hide
+            // its own symptoms — if production is in the middle of
+            // burst-throttling, the diagnostic that's supposed to MEASURE
+            // the latency would stack behind 30 queued live-traffic
+            // connects and report wildly inflated numbers. Diagnostics
+            // must take a parallel path. Per-listener rate-limiting on
+            // /v1/me/ping caps abuse risk.
             match pool.connect_tcp(addr, None).await {
                 Ok((stream, conn_rtt, upstream_egress)) => {
                     connect_ms = Some(conn_rtt);
