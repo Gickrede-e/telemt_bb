@@ -23,7 +23,7 @@ use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{ReplayChecker, Stats};
 use crate::tls_front::TlsFrontCache;
 use crate::transport::UpstreamManager;
-use crate::transport::middle_proxy::{MePool, MeReinitTrigger};
+use crate::transport::middle_proxy::{MePoolMux, MeReinitTrigger};
 
 use super::helpers::write_beobachten_snapshot;
 
@@ -46,12 +46,12 @@ pub(crate) async fn spawn_runtime_tasks(
     stats: Arc<Stats>,
     upstream_manager: Arc<UpstreamManager>,
     replay_checker: Arc<ReplayChecker>,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     rng: Arc<SecureRandom>,
     ip_tracker: Arc<UserIpTracker>,
     beobachten: Arc<BeobachtenStore>,
     api_config_tx: watch::Sender<Arc<ProxyConfig>>,
-    me_pool_for_policy: Option<Arc<MePool>>,
+    me_pool_for_policy: Option<Arc<MePoolMux>>,
     shared_state: Arc<ProxySharedState>,
     me_ready_tx: watch::Sender<u64>,
 ) -> RuntimeWatches {
@@ -133,16 +133,20 @@ pub(crate) async fn spawn_runtime_tasks(
             let cfg = config_rx_policy.borrow_and_update().clone();
             stats_policy
                 .apply_telemetry_policy(TelemetryPolicy::from_config(&cfg.general.telemetry));
-            if let Some(pool) = &me_pool_for_policy {
-                pool.update_runtime_transport_policy(
-                    cfg.general.me_socks_kdf_policy,
-                    cfg.general.me_route_backpressure_enabled,
-                    cfg.general.me_route_fairshare_enabled,
-                    cfg.general.me_route_backpressure_base_timeout_ms,
-                    cfg.general.me_route_backpressure_high_timeout_ms,
-                    cfg.general.me_route_backpressure_high_watermark_pct,
-                    cfg.general.me_reader_route_data_wait_ms,
-                );
+            if let Some(mux) = &me_pool_for_policy {
+                // Transport policy applies identically to every shard —
+                // fan out so all shards reflect the live config.
+                for pool in mux.shards() {
+                    pool.update_runtime_transport_policy(
+                        cfg.general.me_socks_kdf_policy,
+                        cfg.general.me_route_backpressure_enabled,
+                        cfg.general.me_route_fairshare_enabled,
+                        cfg.general.me_route_backpressure_base_timeout_ms,
+                        cfg.general.me_route_backpressure_high_timeout_ms,
+                        cfg.general.me_route_backpressure_high_watermark_pct,
+                        cfg.general.me_reader_route_data_wait_ms,
+                    );
+                }
             }
         }
     });
@@ -256,46 +260,95 @@ pub(crate) async fn spawn_runtime_tasks(
         }
     });
 
-    if let Some(pool) = me_pool {
+    if let Some(mux) = me_pool {
         let reinit_trigger_capacity = config.general.me_reinit_trigger_channel.max(1);
-        let (reinit_tx, reinit_rx) = mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
 
-        let pool_clone_sched = pool.clone();
-        let rng_clone_sched = rng.clone();
-        let config_rx_clone_sched = config_rx.clone();
-        let me_ready_tx_sched = me_ready_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_reinit_scheduler(
-                pool_clone_sched,
-                rng_clone_sched,
-                config_rx_clone_sched,
-                reinit_rx,
-                me_ready_tx_sched,
-            )
-            .await;
-        });
+        // Per-shard reinit scheduler + config updater. Each shard runs its
+        // own reinit lifecycle (its writers, its generation, its hash) so
+        // the channels must be 1:1 with shards — a single channel would
+        // require fan-out logic that wouldn't know which shard to target.
+        // The rotation task is config-driven (no pool refs), so one
+        // instance is shared across all shards' reinit triggers.
+        let mut all_reinit_txs: Vec<mpsc::Sender<MeReinitTrigger>> =
+            Vec::with_capacity(mux.shard_count());
+        for (shard_idx, pool) in mux.shards().iter().enumerate() {
+            let (reinit_tx, reinit_rx) = mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
 
-        let pool_clone = pool.clone();
-        let config_rx_clone = config_rx.clone();
-        let reinit_tx_updater = reinit_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_config_updater(
-                pool_clone,
-                config_rx_clone,
-                reinit_tx_updater,
-            )
-            .await;
-        });
+            let pool_clone_sched = pool.clone();
+            let rng_clone_sched = rng.clone();
+            let config_rx_clone_sched = config_rx.clone();
+            let me_ready_tx_sched = me_ready_tx.clone();
+            tokio::spawn(async move {
+                tracing::debug!(shard_idx, "Starting me_reinit_scheduler for shard");
+                crate::transport::middle_proxy::me_reinit_scheduler(
+                    pool_clone_sched,
+                    rng_clone_sched,
+                    config_rx_clone_sched,
+                    reinit_rx,
+                    me_ready_tx_sched,
+                )
+                .await;
+            });
 
+            let pool_clone = pool.clone();
+            let config_rx_clone = config_rx.clone();
+            let reinit_tx_updater = reinit_tx.clone();
+            tokio::spawn(async move {
+                crate::transport::middle_proxy::me_config_updater(
+                    pool_clone,
+                    config_rx_clone,
+                    reinit_tx_updater,
+                )
+                .await;
+            });
+
+            all_reinit_txs.push(reinit_tx);
+        }
+
+        // Rotation: ONE task drives rotation for the system; a fan-out
+        // hop broadcasts each trigger to every shard's reinit channel so
+        // rotations fire simultaneously across shards.
+        //
+        // The previous design spawned one me_rotation_task per shard.
+        // Each had its own jitter/timer and drifted apart over hours —
+        // two parallel clients of the same operator would see writers
+        // rotate at different wall-clock instants, which is exactly the
+        // anti-detection regression sharding is meant to fix. Single
+        // source + clone-to-all preserves the system-wide invariant.
         let config_rx_clone_rot = config_rx.clone();
-        let reinit_tx_rotation = reinit_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_rotation_task(
-                config_rx_clone_rot,
-                reinit_tx_rotation,
-            )
-            .await;
-        });
+        if all_reinit_txs.len() == 1 {
+            // Single-shard fast path: no fan-out hop needed.
+            let reinit_tx_rotation = all_reinit_txs.remove(0);
+            tokio::spawn(async move {
+                crate::transport::middle_proxy::me_rotation_task(
+                    config_rx_clone_rot,
+                    reinit_tx_rotation,
+                )
+                .await;
+            });
+        } else {
+            let (rotation_source_tx, mut rotation_source_rx) =
+                mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
+            tokio::spawn(async move {
+                crate::transport::middle_proxy::me_rotation_task(
+                    config_rx_clone_rot,
+                    rotation_source_tx,
+                )
+                .await;
+            });
+            let shard_senders = all_reinit_txs;
+            tokio::spawn(async move {
+                while let Some(trigger) = rotation_source_rx.recv().await {
+                    for tx in &shard_senders {
+                        // try_send instead of send().await so a slow
+                        // shard can't backpressure rotation across
+                        // siblings. me_reinit_scheduler handles dedup if
+                        // the channel was already full with a Periodic.
+                        let _ = tx.try_send(trigger);
+                    }
+                }
+            });
+        }
     }
 
     RuntimeWatches {

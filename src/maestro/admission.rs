@@ -6,21 +6,28 @@ use tracing::{info, warn};
 
 use crate::config::ProxyConfig;
 use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
-use crate::transport::middle_proxy::MePool;
+use crate::transport::middle_proxy::MePoolMux;
 
 const STARTUP_FALLBACK_AFTER: Duration = Duration::from_secs(80);
 const RUNTIME_FALLBACK_AFTER: Duration = Duration::from_secs(6);
 
 pub(crate) async fn configure_admission_gate(
     config: &Arc<ProxyConfig>,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     route_runtime: Arc<RouteRuntimeController>,
     admission_tx: &watch::Sender<bool>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
     me_ready_rx: watch::Receiver<u64>,
 ) {
     if config.general.use_middle_proxy {
-        if let Some(pool) = me_pool.as_ref() {
+        if let Some(mux) = me_pool.as_ref() {
+            // Admission gate keys on the primary shard's readiness — that's
+            // the one shard guaranteed to participate in the startup
+            // tracker's me_ready signal. Supplementary shards finishing
+            // init later doesn't change the gate (gate is already open by
+            // then); a supplementary shard staying not-ready degrades only
+            // the fraction of clients hashed to it.
+            let pool = mux.primary();
             let initial_ready = pool.admission_ready_conditional_cast().await;
             let mut fallback_enabled = config.general.me2dc_fallback;
             let mut fast_fallback_enabled = fallback_enabled && config.general.me2dc_fast;

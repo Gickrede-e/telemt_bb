@@ -341,7 +341,9 @@ async fn get_minimal_payload_cached(
         }
     }
 
-    let pool = shared.me_pool.read().await.clone()?;
+    // Stats / status read from the primary shard for now. Phase 2c will
+    // aggregate writers + DC views across all `mux.shards()`.
+    let pool = shared.me_pool.read().await.as_ref()?.primary().clone();
     let status = pool.api_status_snapshot().await;
     let runtime = pool.api_runtime_snapshot().await;
     let generated_at_epoch_secs = status.generated_at_epoch_secs;

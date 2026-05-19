@@ -15,19 +15,19 @@ use crate::startup::{
 };
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::{
-    MePingFamily, MePingSample, MePool, format_me_route, format_sample_line, run_me_ping,
+    MePingFamily, MePingSample, MePoolMux, format_me_route, format_sample_line, run_me_ping,
 };
 
 pub(crate) async fn run_startup_connectivity(
     config: &Arc<ProxyConfig>,
-    me_pool: &Option<Arc<MePool>>,
+    me_pool: &Option<Arc<MePoolMux>>,
     rng: Arc<SecureRandom>,
     startup_tracker: &Arc<StartupTracker>,
     upstream_manager: Arc<UpstreamManager>,
     prefer_ipv6: bool,
     decision: &NetworkDecision,
     process_started_at: Instant,
-    api_me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
+    api_me_pool: Arc<RwLock<Option<Arc<MePoolMux>>>>,
 ) {
     if me_pool.is_some() {
         startup_tracker
@@ -44,7 +44,11 @@ pub(crate) async fn run_startup_connectivity(
             )
             .await;
     }
-    if let Some(pool) = me_pool {
+    if let Some(mux) = me_pool {
+        // Startup connectivity ping uses the primary shard. Each shard
+        // verifies its own connectivity independently via me_health_monitor
+        // after init completes; this gate only blocks startup on shard 0.
+        let pool = mux.primary();
         let me_results = run_me_ping(pool, &rng).await;
 
         let v4_ok = me_results.iter().any(|r| {
@@ -225,8 +229,12 @@ pub(crate) async fn run_startup_connectivity(
     );
     info!("============================================================");
 
-    if let Some(pool) = me_pool {
-        pool.set_runtime_ready(true);
+    if let Some(mux) = me_pool {
+        // Flip runtime-ready ONLY on the primary shard. Supplementary
+        // shards self-flip from their spawn_shard_supervisor as their
+        // own init() completes — this prevents the api gate from
+        // reporting a shard ready before its writer pool is seeded.
+        mux.primary().set_runtime_ready(true);
     }
     *api_me_pool.write().await = me_pool.clone();
 }

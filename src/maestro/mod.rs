@@ -46,7 +46,7 @@ use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{ReplayChecker, Stats};
 use crate::stream::BufferPool;
 use crate::transport::UpstreamManager;
-use crate::transport::middle_proxy::MePool;
+use crate::transport::middle_proxy::MePoolMux;
 use helpers::{parse_cli, resolve_runtime_base_dir, resolve_runtime_config_path};
 
 #[cfg(unix)]
@@ -469,7 +469,13 @@ async fn run_telemt_core(
         RelayRouteMode::Direct
     };
     let route_runtime = Arc::new(RouteRuntimeController::new(initial_route_mode));
-    let api_me_pool = Arc::new(RwLock::new(None::<Arc<MePool>>));
+    // Storage type is now Arc<MePoolMux> — a 1-shard wrapper (Mux::from_single)
+    // for legacy single-pool deployments, an N-shard mux when operator opts in
+    // via `me_writer_bind_mode = "shard"`. API readers that pre-date sharding
+    // call `.primary()` to recover a `&Arc<MePool>`; shard-aware callers
+    // (listeners, per-shard background tasks) consume `mux.shards()` /
+    // `mux.shard_for_peer(...)`.
+    let api_me_pool = Arc::new(RwLock::new(None::<Arc<MePoolMux>>));
     startup_tracker
         .start_component(
             COMPONENT_API_BOOTSTRAP,
@@ -666,7 +672,7 @@ async fn run_telemt_core(
 
     let (me_ready_tx, me_ready_rx) = watch::channel(0_u64);
 
-    let me_pool: Option<Arc<MePool>> = me_startup::initialize_me_pool(
+    let me_pool: Option<Arc<MePoolMux>> = me_startup::initialize_me_pool(
         use_middle_proxy,
         &config,
         &decision,

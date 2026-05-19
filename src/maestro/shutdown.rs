@@ -19,7 +19,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
 use crate::stats::Stats;
-use crate::transport::middle_proxy::MePool;
+use crate::transport::middle_proxy::MePoolMux;
 
 use super::helpers::{format_uptime, unit_label};
 
@@ -47,7 +47,7 @@ impl std::fmt::Display for ShutdownSignal {
 /// Waits for a shutdown signal and performs graceful shutdown.
 pub(crate) async fn wait_for_shutdown(
     process_started_at: Instant,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     stats: Arc<Stats>,
     quota_state_path: PathBuf,
 ) {
@@ -86,7 +86,7 @@ async fn wait_for_shutdown_signal() -> ShutdownSignal {
 async fn perform_shutdown(
     signal: ShutdownSignal,
     process_started_at: Instant,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Option<Arc<MePoolMux>>,
     stats: &Stats,
     quota_state_path: PathBuf,
 ) {
@@ -102,21 +102,24 @@ async fn perform_shutdown(
     let uptime_secs = process_started_at.elapsed().as_secs();
     info!("Uptime: {}", format_uptime(uptime_secs));
 
-    // Graceful ME pool shutdown
-    if let Some(pool) = &me_pool {
-        match tokio::time::timeout(Duration::from_secs(2), pool.shutdown_send_close_conn_all())
-            .await
-        {
-            Ok(total) => {
-                info!(
-                    close_conn_sent = total,
-                    "ME shutdown: RPC_CLOSE_CONN broadcast completed"
-                );
-            }
-            Err(_) => {
-                warn!("ME shutdown: RPC_CLOSE_CONN broadcast timed out");
+    // Graceful ME pool shutdown — broadcast RPC_CLOSE_CONN to every shard
+    // so a degraded shard can't block sibling shards' clean shutdown past
+    // the 2s budget.
+    if let Some(mux) = &me_pool {
+        let mut total_close_conn: usize = 0;
+        for pool in mux.shards() {
+            match tokio::time::timeout(Duration::from_secs(2), pool.shutdown_send_close_conn_all())
+                .await
+            {
+                Ok(t) => total_close_conn = total_close_conn.saturating_add(t),
+                Err(_) => warn!("ME shutdown: RPC_CLOSE_CONN timed out on a shard"),
             }
         }
+        info!(
+            close_conn_sent = total_close_conn,
+            shards = mux.shard_count(),
+            "ME shutdown: RPC_CLOSE_CONN broadcast completed"
+        );
     }
 
     match crate::quota_state::save_quota_state(&quota_state_path, stats).await {
