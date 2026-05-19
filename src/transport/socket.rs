@@ -117,9 +117,17 @@ pub fn set_linger_zero(stream: &TcpStream) -> Result<()> {
 /// ACK on outbound data. That trade-off is wrong for an MTProto proxy
 /// where the typical exchange is short request/response patterns: every
 /// delayed ACK directly extends user-perceived latency on the next
-/// reply. QUICKACK tells the kernel to send the ACK immediately for the
-/// next few segments; it auto-clears once the stack believes delayed
-/// ACKs would help again, so we re-apply on every fresh connection.
+/// reply.
+///
+/// **Important:** TCP_QUICKACK is **strictly one-shot** on Linux (kernel
+/// 3.x through 6.x — `tcp_check_space()` clears `icsk_ack.pingpong`
+/// after the next ACK is sent). Setting it at connect/accept only
+/// accelerates the FIRST ACK on the socket — typically the ACK of the
+/// MTProto handshake response. After that, delayed-ACK resumes.
+/// A future change can re-apply it after each hot-path read for a
+/// larger win; today the call is positioned to bite during the
+/// latency-sensitive handshake-completion phase, which is the highest-
+/// value single point.
 ///
 /// Best-effort: failure (non-Linux, restricted seccomp, etc.) leaves
 /// the socket on default delayed-ACK behaviour. We never fail-close on

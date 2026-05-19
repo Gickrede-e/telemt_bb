@@ -260,20 +260,23 @@ impl MePool {
 
     /// Enable TCP_QUICKACK on a freshly-connected outbound TG socket.
     ///
-    /// By default Linux uses delayed ACKs (40 ms maximum) on
-    /// established sockets, which optimises bulk-data scenarios but adds
-    /// latency to small request/response patterns. ME writers are
-    /// exactly that pattern — short MTProto messages bounced through
-    /// Telegram's middle-proxy infrastructure where the first byte of a
-    /// reply may be delayed up to one ack-cycle. Enabling QUICKACK on
-    /// connect drops the artificial pause for the next few segments
-    /// (kernel clears the flag automatically once delayed-ACK quirks
-    /// suggest it's no longer beneficial).
+    /// Linux's default delayed-ACK behaviour can add up to ~40 ms of
+    /// pause before ACK'ing a small segment. For ME writers — short
+    /// MTProto messages bounced through Telegram's middle-proxy
+    /// infrastructure — this is pure latency on the first reply.
     ///
-    /// The setsockopt is best-effort: failing kernels (non-Linux, old
-    /// LXC namespaces with seccomp filters) just keep the default
-    /// delayed-ACK behaviour. We log at warn level and continue — never
-    /// fail-close on a perf hint.
+    /// **Important:** TCP_QUICKACK is strictly one-shot on Linux
+    /// (kernel `tcp_check_space()` clears it after the next ACK is
+    /// sent). This call only accelerates the FIRST ACK of the
+    /// outbound connection — typically the ACK of the TG ME RPC
+    /// handshake response. Subsequent ACKs revert to delayed-ACK.
+    /// A future iteration may re-apply QUICKACK on every hot-path
+    /// read; today we capture the single highest-value point
+    /// (handshake completion).
+    ///
+    /// Best-effort: failing kernels (non-Linux, old LXC namespaces
+    /// with seccomp filters) just keep the default delayed-ACK
+    /// behaviour. We log at debug level and continue.
     #[cfg(target_os = "linux")]
     fn configure_quickack(fd: RawFd) -> std::io::Result<()> {
         let on: c_int = 1;
